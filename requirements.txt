@@ -1,0 +1,7 @@
+anthropic>=0.40.0
+web3>=6.0.0
+xrpl-py>=2.0.0
+python-dotenv>=1.0.0
+requests>=2.31.0
+schedule>=1.2.0        # 스케줄러
+notion-client>=2.0.0   # 선택사항
