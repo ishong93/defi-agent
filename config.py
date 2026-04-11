@@ -29,15 +29,44 @@ class ChainConfig:
 
 
 @dataclass
+class ToolValidationConfig:
+    """Factor 4: 도구 호출 검증 설정 (도구 호출 = 제안)"""
+    max_transfer_usd: float = 10000.0       # 단일 전송 최대 금액 ($)
+    max_slippage_pct: float = 3.0           # 스왑 최대 슬리피지 (%)
+    require_human_above_usd: float = 5000.0 # 이 금액 이상이면 사람 확인 필수
+    dry_run_default: bool = False            # 기본 드라이런 모드
+
+
+@dataclass
+class ErrorHandlingConfig:
+    """Factor 9: 에러 처리 설정"""
+    max_consecutive_errors: int = 3         # 연속 에러 N회 시 에스컬레이션
+    max_error_msg_len: int = 200            # 에러 메시지 최대 길이
+    escalate_to_human: bool = True          # 연속 에러 시 사람에게 에스컬레이션
+
+
+@dataclass
+class ContextConfig:
+    """Factor 3/10: 컨텍스트 관리 설정"""
+    max_context_messages: int = 20          # 컨텍스트 최대 메시지 수
+    context_format: str = "xml"             # "xml" | "plain" (Factor 3: 커스텀 형식)
+    step_warning_threshold: int = 10        # Factor 10: 이 스텝 수 이후 경고
+    snapshot_stale_minutes: int = 30        # Factor 6: 스냅샷 신선도 임계값 (분)
+
+
+@dataclass
 class AgentConfig:
     """에이전트 동작 설정"""
-    model: str = "claude-opus-4-5"
+    model: str = "claude-sonnet-4-20250514"
     max_steps: int = 15
     check_interval_minutes: int = 60   # 정기 모니터링 주기
     report_hour: int = 9               # 매일 오전 9시 일간 리포트
     language: str = "ko"               # 리포트 언어
     chains: ChainConfig = field(default_factory=ChainConfig)
     alerts: AlertThresholds = field(default_factory=AlertThresholds)
+    tool_validation: ToolValidationConfig = field(default_factory=ToolValidationConfig)
+    error_handling: ErrorHandlingConfig = field(default_factory=ErrorHandlingConfig)
+    context: ContextConfig = field(default_factory=ContextConfig)
 
     # 출력 채널 (선택)
     telegram_token: Optional[str] = field(

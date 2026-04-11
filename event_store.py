@@ -15,7 +15,8 @@ import dataclasses
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional
-from events import (AgentEvent, TaskStarted, LLMResponded, ToolSucceeded,
+from events import (AgentEvent, TaskStarted, SnapshotRefreshed,
+                    LLMResponded, ToolRejected, ToolSucceeded,
                     ToolFailed, HumanAsked, HumanResponded, ContextCompacted,
                     AgentCompleted, AgentFailed)
 
@@ -23,15 +24,17 @@ DB_PATH = Path("state/events.db")
 
 # 이벤트 kind → 클래스 매핑
 EVENT_CLASSES = {
-    "TaskStarted":      TaskStarted,
-    "LLMResponded":     LLMResponded,
-    "ToolSucceeded":    ToolSucceeded,
-    "ToolFailed":       ToolFailed,
-    "HumanAsked":       HumanAsked,
-    "HumanResponded":   HumanResponded,
-    "ContextCompacted": ContextCompacted,
-    "AgentCompleted":   AgentCompleted,
-    "AgentFailed":      AgentFailed,
+    "TaskStarted":       TaskStarted,
+    "SnapshotRefreshed": SnapshotRefreshed,
+    "LLMResponded":      LLMResponded,
+    "ToolRejected":      ToolRejected,
+    "ToolSucceeded":     ToolSucceeded,
+    "ToolFailed":        ToolFailed,
+    "HumanAsked":        HumanAsked,
+    "HumanResponded":    HumanResponded,
+    "ContextCompacted":  ContextCompacted,
+    "AgentCompleted":    AgentCompleted,
+    "AgentFailed":       AgentFailed,
 }
 
 

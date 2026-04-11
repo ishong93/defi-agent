@@ -2,6 +2,13 @@
 #
 # LLM 호출을 스크립트된 응답으로 교체하여
 # 실제 API 키 없이도 전체 흐름을 검증.
+#
+# Factor 4:  도구 호출 검증/거부 흐름
+# Factor 6:  재개 + 스냅샷 신선도
+# Factor 7:  사람 개입 (ask_human)
+# Factor 8:  세 가지 제어 흐름
+# Factor 9:  연속 에러 에스컬레이션
+# Factor 12: ScriptedLLM 주입
 
 import pytest
 import tempfile
@@ -9,7 +16,8 @@ from pathlib import Path
 from datetime import datetime
 from collections import deque
 
-from events import (TaskStarted, LLMResponded, ToolSucceeded, ToolFailed,
+from events import (TaskStarted, SnapshotRefreshed, LLMResponded,
+                    ToolRejected, ToolSucceeded, ToolFailed,
                     HumanAsked, HumanResponded, AgentCompleted, AgentFailed)
 from event_store import EventStore
 from reducer import derive_context
@@ -62,7 +70,7 @@ def make_config(max_steps=10) -> AgentConfig:
 class ScriptedLLM:
     """
     사전에 정의된 응답을 순서대로 반환하는 목 LLM.
-    실제 API 없이 전체 흐름 테스트 가능.
+    Factor 12: LLMCallFn 주입으로 실제 API 없이 전체 흐름 테스트 가능.
     """
     def __init__(self, responses: list[str]):
         self.queue   = deque(responses)
@@ -117,7 +125,7 @@ class TestNormalFlow:
         assert types[-1] == "AgentCompleted"
 
     def test_llm_receives_tool_results_in_context(self):
-        """LLM이 두 번째 호출 시 첫 번째 툴 결과를 컨텍스트에서 받음"""
+        """LLM이 두 번째 호출 시 첫 번째 도구 결과를 컨텍스트에서 받음"""
         llm = ScriptedLLM([
             '{"tool":"fetch_defi_yields","params":{"chain":"Flare"},"reason":"수익률 조회"}',
             '{"tool":"done","params":{"summary":"수익률 확인 완료"},"reason":"끝"}',
@@ -125,7 +133,6 @@ class TestNormalFlow:
         store = make_store()
         run_agent(make_snapshot(), "alert_check", make_config(), llm_fn=llm, store=store)
 
-        # 두 번째 LLM 호출의 messages 확인
         second_call_messages = llm.calls[1]
         content_str = str(second_call_messages)
         assert "fetch_defi_yields" in content_str or "stXRP" in content_str
@@ -170,7 +177,6 @@ class TestHumanInTheLoop:
         run_agent(make_snapshot(), "alert_check", make_config(),
                   llm_fn=llm, human_input_fn=human_fn, store=store)
 
-        # 두 번째 LLM 호출에 사람 응답 포함 확인
         assert "텔레그램으로 알림 보내줘" in str(llm.calls[1])
 
 
@@ -181,9 +187,9 @@ class TestHumanInTheLoop:
 class TestFaultTolerance:
 
     def test_tool_error_does_not_crash_agent(self):
-        """툴 에러가 발생해도 에이전트가 계속 실행됨"""
+        """도구 에러가 발생해도 에이전트가 계속 실행됨"""
         llm = ScriptedLLM([
-            '{"tool":"nonexistent_tool","params":{},"reason":"없는 툴"}',
+            '{"tool":"nonexistent_tool","params":{},"reason":"없는 도구"}',
             '{"tool":"done","params":{"summary":"에러 후 복구 완료"},"reason":"끝"}',
         ])
         store  = make_store()
@@ -191,7 +197,6 @@ class TestFaultTolerance:
                            llm_fn=llm, store=store)
 
         assert result["status"] == "done"
-        # ToolFailed 이벤트가 저장됐는지 확인
         events      = store.load(result["run_id"])
         fail_events = [e for e in events if isinstance(e, ToolFailed)]
         assert len(fail_events) == 1
@@ -210,9 +215,57 @@ class TestFaultTolerance:
 
         assert result["status"] == "done"
 
+    def test_consecutive_errors_escalate_to_human(self):
+        """Factor 9: 연속 에러 3회 → 사람에게 에스컬레이션"""
+        llm = ScriptedLLM([
+            '{"tool":"nonexistent_1","params":{},"reason":"test1"}',
+            '{"tool":"nonexistent_2","params":{},"reason":"test2"}',
+            '{"tool":"nonexistent_3","params":{},"reason":"test3"}',
+            '{"tool":"done","params":{"summary":"에스컬레이션 후 완료"},"reason":"끝"}',
+        ])
+        human_answers = deque(["계속 진행해"])
+        human_fn = lambda level, q, ctx="": human_answers.popleft() if human_answers else "계속"
+
+        config = make_config()
+        config.error_handling.max_consecutive_errors = 3
+        store  = make_store()
+        result = run_agent(make_snapshot(), "alert_check", config,
+                           llm_fn=llm, human_input_fn=human_fn, store=store)
+
+        assert result["status"] == "done"
+        events = store.load(result["run_id"])
+        # 에스컬레이션으로 인한 HumanAsked 이벤트 확인
+        asked = [e for e in events if isinstance(e, HumanAsked)]
+        assert len(asked) >= 1
+        assert any("연속" in e.question for e in asked)
+
 
 # ══════════════════════════════════════════════════════════════════
-#  4. Factor 6 재개 테스트
+#  4. Factor 4: 도구 검증/거부 통합 테스트
+# ══════════════════════════════════════════════════════════════════
+
+class TestToolValidationIntegration:
+
+    def test_tool_rejected_recorded_and_agent_continues(self):
+        """도구가 거부되면 ToolRejected 이벤트가 기록되고 에이전트가 계속 진행"""
+        llm = ScriptedLLM([
+            '{"tool":"transfer","params":{"amount_usd":999999,"slippage_pct":10},"reason":"전송"}',
+            '{"tool":"done","params":{"summary":"거부 후 완료"},"reason":"끝"}',
+        ])
+        config = make_config()
+        config.tool_validation.max_slippage_pct = 3.0
+        store  = make_store()
+        result = run_agent(make_snapshot(), "alert_check", config,
+                           llm_fn=llm, store=store)
+
+        assert result["status"] == "done"
+        events = store.load(result["run_id"])
+        rejected = [e for e in events if isinstance(e, ToolRejected)]
+        assert len(rejected) >= 1
+
+
+# ══════════════════════════════════════════════════════════════════
+#  5. Factor 6 재개 테스트
 # ══════════════════════════════════════════════════════════════════
 
 class TestResumeCapability:
@@ -243,8 +296,6 @@ class TestResumeCapability:
 
         assert result2["status"] == "done"
         assert "재개 후 완료" in result2["summary"]
-
-        # 이벤트가 누적됨 (재개 후 추가됨)
         events_after = store.count_events(run_id)
         assert events_after > events_before
 
@@ -259,17 +310,15 @@ class TestResumeCapability:
                            llm_fn=llm, store=store)
         run_id = result["run_id"]
 
-        # 전체 이벤트 replay
         all_events   = store.load(run_id)
         replayed_ctx = derive_context(all_events)
 
-        # ToolSucceeded 결과가 context에 포함됨
         content = str(replayed_ctx)
         assert "fetch_all_portfolios" in content or "포트폴리오" in content
 
 
 # ══════════════════════════════════════════════════════════════════
-#  5. 타임머신 (Point-in-time) 테스트
+#  6. 타임머신 (Point-in-time) 테스트
 # ══════════════════════════════════════════════════════════════════
 
 class TestTimeMachine:
@@ -285,7 +334,6 @@ class TestTimeMachine:
                            llm_fn=llm, store=store)
 
         ctx_at_start = replay_at(result["run_id"], seq=0, store=store)
-        # TaskStarted 이벤트만 → 포트폴리오 요약만 있어야 함
         content = str(ctx_at_start)
         assert "포트폴리오" in content or "Flare" in content
 
@@ -304,13 +352,12 @@ class TestTimeMachine:
         ctx_1 = replay_at(run_id, seq=1, store=store)
         ctx_2 = replay_at(run_id, seq=2, store=store)
 
-        # 이벤트가 쌓일수록 context 길이 증가
         assert len(ctx_1) >= len(ctx_0)
         assert len(ctx_2) >= len(ctx_1)
 
 
 # ══════════════════════════════════════════════════════════════════
-#  6. 데이터 fetcher 테스트
+#  7. 데이터 fetcher 테스트
 # ══════════════════════════════════════════════════════════════════
 
 class TestDataFetchers:
@@ -332,3 +379,43 @@ class TestDataFetchers:
         assert result.chain == "XDC"
         assert len(result.staking_positions) > 0
         assert result.staking_positions[0].protocol == "PrimeStaking"
+
+
+# ══════════════════════════════════════════════════════════════════
+#  8. Factor 3: 컨텍스트 형식 전환 통합 테스트
+# ══════════════════════════════════════════════════════════════════
+
+class TestContextFormatIntegration:
+
+    def test_xml_format_in_full_run(self):
+        """XML 형식으로 전체 실행 시 정상 동작"""
+        llm = ScriptedLLM([
+            '{"tool":"fetch_all_portfolios","params":{},"reason":"조회"}',
+            '{"tool":"done","params":{"summary":"XML 형식 완료"},"reason":"끝"}',
+        ])
+        config = make_config()
+        config.context.context_format = "xml"
+        store = make_store()
+        result = run_agent(make_snapshot(), "alert_check", config,
+                           llm_fn=llm, store=store)
+
+        assert result["status"] == "done"
+        # LLM이 받은 context에 XML 태그가 포함됐는지 확인
+        second_ctx = str(llm.calls[1])
+        assert "<tool_result" in second_ctx or "<system_instruction>" in second_ctx
+
+    def test_plain_format_in_full_run(self):
+        """평문 형식으로 전체 실행 시 정상 동작"""
+        llm = ScriptedLLM([
+            '{"tool":"fetch_all_portfolios","params":{},"reason":"조회"}',
+            '{"tool":"done","params":{"summary":"Plain 형식 완료"},"reason":"끝"}',
+        ])
+        config = make_config()
+        config.context.context_format = "plain"
+        store = make_store()
+        result = run_agent(make_snapshot(), "alert_check", config,
+                           llm_fn=llm, store=store)
+
+        assert result["status"] == "done"
+        second_ctx = str(llm.calls[1])
+        assert "<tool_result" not in second_ctx
