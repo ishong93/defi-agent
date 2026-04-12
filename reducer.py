@@ -25,6 +25,7 @@ from __future__ import annotations
 from events import (AgentEvent, TaskStarted, SnapshotRefreshed,
                     LLMResponded, ToolRejected, ToolSucceeded,
                     ToolFailed, HumanAsked, HumanResponded, ContextCompacted,
+                    SubAgentStarted, SubAgentCompleted,
                     AgentCompleted, AgentFailed)
 from prompts import SYSTEM_PROMPT, XML_CONTEXT_TEMPLATES
 
@@ -104,6 +105,17 @@ def derive_context(events: list[AgentEvent], context_format: str = "xml") -> lis
                 messages.append({
                     "role": "user",
                     "content": fmt("human_response", content=answer)
+                })
+
+            case SubAgentStarted(agent_name=name, task=sub_task):
+                pass  # Controller의 LLMResponded에 이미 delegate 정보 있음
+
+            case SubAgentCompleted(agent_name=name, status=st, summary=summ):
+                # Factor 10: Sub-Agent 결과를 Controller context에 삽입
+                messages.append({
+                    "role": "user",
+                    "content": fmt("sub_agent_result", name=name,
+                                   status=st, content=summ)
                 })
 
             case ContextCompacted():
@@ -188,6 +200,12 @@ def _apply_compaction(events: list[AgentEvent], messages: list[dict],
                     "content": fmt("snapshot_refresh", content=s,
                                    stale_minutes=str(st))
                 })
+            case SubAgentCompleted(agent_name=n, status=st, summary=summ):
+                messages_after.append({
+                    "role": "user",
+                    "content": fmt("sub_agent_result", name=n,
+                                   status=st, content=summ)
+                })
 
     return [{
         "role": "user",
@@ -271,6 +289,7 @@ def _plain_formatter(template_key: str, **kwargs) -> str:
         "compaction": lambda: f"[이전 {kwargs.get('count', '?')}개 스텝 요약]\n{kwargs.get('content', '')}",
         "step_warning": lambda: f"[경고] 현재 {kwargs.get('current', '?')}/{kwargs.get('max', '?')} 스텝 — {kwargs.get('message', '')}",
         "error_escalation": lambda: f"[에러 에스컬레이션] 연속 {kwargs.get('count', '?')}회 — {kwargs.get('message', '')}",
+        "sub_agent_result": lambda: f"[{kwargs.get('name', '')} 에이전트 결과 ({kwargs.get('status', '')})] {kwargs.get('content', '')}",
     }
     fn = formatters.get(template_key, lambda: str(kwargs))
     return fn()

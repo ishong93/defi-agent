@@ -110,6 +110,30 @@ class ContextCompacted(BaseEvent):
 
 
 @dataclass(frozen=True)
+class SubAgentStarted(BaseEvent):
+    """
+    Factor 10 + Factor 7: Controller가 Sub-Agent에게 작업을 위임함.
+    Agent→Agent 통신 = Agent→Human과 동일한 패턴.
+    """
+    kind:       Literal["SubAgentStarted"] = "SubAgentStarted"
+    agent_name: str = ""
+    task:       str = ""
+
+
+@dataclass(frozen=True)
+class SubAgentCompleted(BaseEvent):
+    """
+    Factor 10: Sub-Agent가 결과를 반환함.
+    Controller는 이 결과를 바탕으로 다음 행동을 결정.
+    """
+    kind:       Literal["SubAgentCompleted"] = "SubAgentCompleted"
+    agent_name: str = ""
+    status:     str = ""             # "done" | "failed" | "max_steps_exceeded"
+    summary:    str = ""
+    sub_run_id: str = ""             # Sub-Agent의 독립 run_id (추적용)
+
+
+@dataclass(frozen=True)
 class AgentCompleted(BaseEvent):
     """에이전트가 정상 완료됨"""
     kind:    Literal["AgentCompleted"] = "AgentCompleted"
@@ -128,5 +152,6 @@ AgentEvent = Union[
     TaskStarted, SnapshotRefreshed,
     LLMResponded, ToolRejected, ToolSucceeded, ToolFailed,
     HumanAsked, HumanResponded, ContextCompacted,
+    SubAgentStarted, SubAgentCompleted,
     AgentCompleted, AgentFailed,
 ]

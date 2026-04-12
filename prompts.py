@@ -80,4 +80,5 @@ XML_CONTEXT_TEMPLATES = {
     "compaction": "<compacted_summary count=\"{count}\">\n{content}\n</compacted_summary>",
     "step_warning": "<step_warning current=\"{current}\" max=\"{max}\">\n{message}\n</step_warning>",
     "error_escalation": "<error_escalation consecutive=\"{count}\">\n{message}\n</error_escalation>",
+    "sub_agent_result": "<sub_agent_result agent=\"{name}\" status=\"{status}\">\n{content}\n</sub_agent_result>",
 }

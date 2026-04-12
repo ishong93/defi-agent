@@ -18,23 +18,26 @@ from typing import Optional
 from events import (AgentEvent, TaskStarted, SnapshotRefreshed,
                     LLMResponded, ToolRejected, ToolSucceeded,
                     ToolFailed, HumanAsked, HumanResponded, ContextCompacted,
+                    SubAgentStarted, SubAgentCompleted,
                     AgentCompleted, AgentFailed)
 
 DB_PATH = Path("state/events.db")
 
 # 이벤트 kind → 클래스 매핑
 EVENT_CLASSES = {
-    "TaskStarted":       TaskStarted,
-    "SnapshotRefreshed": SnapshotRefreshed,
-    "LLMResponded":      LLMResponded,
-    "ToolRejected":      ToolRejected,
-    "ToolSucceeded":     ToolSucceeded,
-    "ToolFailed":        ToolFailed,
-    "HumanAsked":        HumanAsked,
-    "HumanResponded":    HumanResponded,
-    "ContextCompacted":  ContextCompacted,
-    "AgentCompleted":    AgentCompleted,
-    "AgentFailed":       AgentFailed,
+    "TaskStarted":        TaskStarted,
+    "SnapshotRefreshed":  SnapshotRefreshed,
+    "LLMResponded":       LLMResponded,
+    "ToolRejected":       ToolRejected,
+    "ToolSucceeded":      ToolSucceeded,
+    "ToolFailed":         ToolFailed,
+    "HumanAsked":         HumanAsked,
+    "HumanResponded":     HumanResponded,
+    "ContextCompacted":   ContextCompacted,
+    "SubAgentStarted":    SubAgentStarted,
+    "SubAgentCompleted":  SubAgentCompleted,
+    "AgentCompleted":     AgentCompleted,
+    "AgentFailed":        AgentFailed,
 }
 
 
