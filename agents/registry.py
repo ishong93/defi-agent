@@ -179,10 +179,14 @@ MONITOR_PROMPT = """
 당신은 DeFi 포트폴리오 모니터링 전문 에이전트입니다.
 역할: 포트폴리오 현황 조회, 가격 변동 추적, 이상 징후 탐지.
 
+## 사전 수집 데이터 (Factor 13: Pre-fetch)
+포트폴리오 데이터는 이미 컨텍스트에 포함되어 있습니다.
+fetch_portfolios를 다시 호출할 필요 없이, 바로 분석/탐지를 시작하세요.
+
 ## 도구 (JSON 형식으로만 반환)
-{"tool": "fetch_portfolios", "params": {}, "reason": "포트폴리오 조회"}
 {"tool": "detect_alerts", "params": {}, "reason": "이상 징후 탐지"}
 {"tool": "fetch_price_history", "params": {"asset": "FLR|XDC|XRP"}, "reason": "가격 추이"}
+{"tool": "fetch_portfolios", "params": {}, "reason": "포트폴리오 재조회 (데이터 갱신 필요 시에만)"}
 {"tool": "ask_human", "params": {"level": "...", "question": "..."}, "reason": "사람 확인"}
 {"tool": "done", "params": {"summary": "..."}, "reason": "완료"}
 
@@ -229,6 +233,10 @@ TRADER_PROMPT = """
 REBALANCER_PROMPT = """
 당신은 포트폴리오 리밸런싱 분석 전문 에이전트입니다.
 역할: 현재 배분 분석, 목표 배분 비교, 리밸런싱 거래 계산.
+
+## 사전 수집 데이터 (Factor 13: Pre-fetch)
+포트폴리오 데이터는 이미 컨텍스트에 포함되어 있습니다.
+바로 배분 분석을 시작하세요.
 
 ## 도구 (JSON 형식으로만 반환)
 {"tool": "get_current_allocation", "params": {}, "reason": "현재 배분 조회"}

@@ -40,14 +40,19 @@ def derive_context(events: list[AgentEvent], context_format: str = "xml") -> lis
     이벤트 목록 → LLM API에 넘길 messages 배열.
 
     Factor 3: context_format 파라미터로 형식 전환 (A/B 테스트 가능)
-      - "xml":   XML 태그로 구조화된 형식 (기본값)
-      - "plain": 기존 평문 형식
+      - "xml":    XML 태그로 구조화된 형식 (기본값)
+      - "plain":  기존 평문 형식
+      - "single": 모든 이벤트를 단일 user 메시지로 결합 (원문 Factor 3 패턴)
 
     이 함수만 있으면:
     - 어느 시점이든 context 재현 가능 (replay)
     - 특정 스텝으로 롤백 = events[:N]으로 호출
     - 브랜치 = 다른 이벤트 붙여서 호출
     """
+    # Factor 3: "single" 모드 — 원문의 thread_to_prompt() 패턴
+    if context_format == "single":
+        return _derive_single_message(events)
+
     fmt = _xml_formatter if context_format == "xml" else _plain_formatter
     messages: list[dict] = []
 
@@ -293,3 +298,52 @@ def _plain_formatter(template_key: str, **kwargs) -> str:
     }
     fn = formatters.get(template_key, lambda: str(kwargs))
     return fn()
+
+
+def _derive_single_message(events: list[AgentEvent]) -> list[dict]:
+    """
+    Factor 3 원문 패턴: thread_to_prompt().
+    모든 이벤트를 XML 태그로 변환하여 단일 user 메시지에 결합.
+
+    원문: "Here's everything that happened so far: ..."
+    → 하나의 user 메시지에 모든 컨텍스트를 넣어 LLM의 주의를 집중시킨다.
+    """
+    resolved = _find_resolved_errors(events)
+    parts = [f"<system_instruction>\n{SYSTEM_PROMPT}\n</system_instruction>"]
+
+    for i, event in enumerate(events):
+        match event:
+            case TaskStarted(task=task, portfolio_summary=summary):
+                parts.append(
+                    f"<task_started>\n"
+                    f"<portfolio>\n{summary}\n</portfolio>\n"
+                    f"<task>{_task_description(task)}</task>\n"
+                    f"</task_started>"
+                )
+            case SnapshotRefreshed(portfolio_summary=s, stale_minutes=st):
+                parts.append(
+                    f"<snapshot_refreshed stale_minutes=\"{st}\">\n{s}\n</snapshot_refreshed>"
+                )
+            case LLMResponded(raw_output=output):
+                parts.append(f"<agent_action>\n{output}\n</agent_action>")
+            case ToolSucceeded(tool_name=name, result=result):
+                parts.append(f"<tool_result name=\"{name}\">\n{result}\n</tool_result>")
+            case ToolFailed(tool_name=name, error_type=etype, error_msg=emsg):
+                if i not in resolved:
+                    parts.append(
+                        f"<tool_error name=\"{name}\">\n{etype}: {emsg[:MAX_ERROR_LEN]}\n</tool_error>"
+                    )
+            case ToolRejected(tool_name=name, reject_reason=reason, original_params=params):
+                parts.append(
+                    f"<tool_rejected name=\"{name}\">\n거부 사유: {reason}\n원래 파라미터: {params}\n</tool_rejected>"
+                )
+            case HumanResponded(answer=answer):
+                parts.append(f"<human_response>\n{answer}\n</human_response>")
+            case SubAgentCompleted(agent_name=name, status=st, summary=summ):
+                parts.append(
+                    f"<sub_agent_result agent=\"{name}\" status=\"{st}\">\n{summ}\n</sub_agent_result>"
+                )
+
+    parts.append("\nWhat should the next step be?")
+
+    return [{"role": "user", "content": "\n\n".join(parts)}]
