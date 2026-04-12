@@ -1,43 +1,124 @@
 # tools.py — Factor 4: Tools are Structured Outputs
-# 모든 툴 정의, 파싱, 실행 디스패치는 이 파일에서만
+#
+# Factor 4 원문 핵심:
+#   "LLM이 선택한 도구 호출은 '제안(proposal)'이지 '명령'이 아니다."
+#   코드가 최종 결정권을 갖는다 — 검증, 거부, 드라이런 모두 가능.
+#
+# Factor 6 원문 핵심:
+#   "Selection/Execution 분리 — LLM이 도구를 선택한 후,
+#    실제 실행 전에 검증 단계를 삽입할 수 있다."
 
 import json
-from typing import Callable
+from dataclasses import dataclass
+from typing import Callable, Optional
 from models import PortfolioSnapshot
+from config import AgentConfig
 
+
+# ── 검증 결과 타입 ───────────────────────────────────────────────
+
+@dataclass
+class ValidationResult:
+    """도구 호출 검증 결과 (Factor 4: 도구 호출 = 제안)"""
+    approved: bool
+    reject_reason: Optional[str] = None
+    requires_human: bool = False
+    human_question: Optional[str] = None
+
+
+# ── 파싱 ─────────────────────────────────────────────────────────
 
 def parse_tool_call(llm_output: str) -> dict:
-    """LLM 출력에서 툴 호출 파싱"""
+    """
+    LLM 출력에서 도구 호출 파싱.
+    Factor 7: LLM은 반드시 JSON만 출력해야 한다.
+    파싱 실패 시 프레임워크가 대신 의사결정하지 않고 에러를 발생시킨다.
+    """
     try:
         text = llm_output.strip()
         if "```" in text:
             text = text.split("```")[1].lstrip("json").strip()
         return json.loads(text)
     except Exception as e:
-        # 파싱 실패 → ask_human으로 폴백
-        return {
-            "tool": "ask_human",
-            "params": {"level": "info", "question": "LLM 응답 파싱 실패, 계속할까요?",
-                       "context": llm_output[:150]},
-            "reason": f"parse_error: {e}"
-        }
+        raise ValueError(
+            f"LLM JSON 파싱 실패: {e} | 출력: {llm_output[:150]}"
+        )
 
 
-# ── 툴 실행 레지스트리 ────────────────────────────────────────────
+# ── 검증 (Factor 4: Selection → Validation → Execution) ─────────
+
+def validate_tool_call(tool_call: dict, config: AgentConfig) -> ValidationResult:
+    """
+    Factor 4: 도구 호출을 실행 전에 검증.
+    LLM의 제안을 코드가 검토하는 단계.
+
+    검증 항목:
+    - 금액 한도 (max_transfer_usd)
+    - 슬리피지 위험 (max_slippage_pct)
+    - 사람 확인 필요 여부 (require_human_above_usd)
+    """
+    tool = tool_call.get("tool", "")
+    params = tool_call.get("params", {})
+    validation = config.tool_validation
+
+    # done, ask_human은 항상 허용
+    if tool in ("done", "ask_human"):
+        return ValidationResult(approved=True)
+
+    # 텔레그램 알림: critical 레벨은 사람 확인 필수
+    if tool == "send_telegram_alert":
+        level = params.get("level", "info")
+        if level == "critical":
+            return ValidationResult(
+                approved=False,
+                requires_human=True,
+                human_question=f"Critical 알림 발송 승인이 필요합니다: {params.get('message', '')[:100]}"
+            )
+
+    # 금액이 포함된 도구: 한도 검증
+    amount_usd = params.get("amount_usd", 0)
+    if amount_usd > 0:
+        if amount_usd > validation.max_transfer_usd:
+            return ValidationResult(
+                approved=False,
+                reject_reason=f"금액 한도 초과: ${amount_usd:,.0f} > 최대 ${validation.max_transfer_usd:,.0f}"
+            )
+        if amount_usd > validation.require_human_above_usd:
+            return ValidationResult(
+                approved=False,
+                requires_human=True,
+                human_question=f"${amount_usd:,.0f} 규모 작업 승인이 필요합니다."
+            )
+
+    # 슬리피지 검증
+    slippage = params.get("slippage_pct", 0)
+    if slippage > validation.max_slippage_pct:
+        return ValidationResult(
+            approved=False,
+            reject_reason=f"슬리피지 위험: {slippage}% > 최대 {validation.max_slippage_pct}%"
+        )
+
+    return ValidationResult(approved=True)
+
+
+# ── 도구 실행 레지스트리 ─────────────────────────────────────────
 
 class ToolExecutor:
     """
-    Factor 4: 툴은 단순히 구조화된 출력을 실행하는 함수들의 집합
-    Factor 5: snapshot을 통해 실행 상태와 비즈니스 상태를 통합
+    Factor 4: 도구는 구조화된 출력을 실행하는 함수들의 집합.
+    Factor 5: snapshot을 통해 실행 상태와 비즈니스 상태를 통합.
+
+    핵심 흐름:
+      LLM 제안 → validate_tool_call() → 승인 시 dispatch() → 결과 반환
     """
 
-    def __init__(self, snapshot: PortfolioSnapshot, config):
+    def __init__(self, snapshot: PortfolioSnapshot, config: AgentConfig):
         self.snapshot = snapshot
         self.config = config
-        self._report_cache: dict = {}   # Factor 5: 생성된 리포트 상태 보관
+        self._report_cache: dict = {}
 
     def dispatch(self, tool_call: dict) -> str:
-        """툴 이름으로 실행 함수 디스패치"""
+        """도구 이름으로 실행 함수 디스패치"""
         tool = tool_call.get("tool")
         params = tool_call.get("params", {})
 
@@ -53,12 +134,12 @@ class ToolExecutor:
         }
 
         if tool not in handlers:
-            raise ValueError(f"알 수 없는 툴: {tool}")
+            raise ValueError(f"알 수 없는 도구: {tool}")
 
         return handlers[tool](params)
 
     def _fetch_all_portfolios(self, params: dict) -> str:
-        """이미 수집된 스냅샷 반환 (사전 수집 패턴 — Factor 13)"""
+        """이미 수집된 스냅샷 반환 (루프 시작 전 사전 수집 패턴)"""
         return self.snapshot.to_context_summary()
 
     def _fetch_price_history(self, params: dict) -> str:
@@ -97,8 +178,6 @@ class ToolExecutor:
 
     def _detect_alerts(self, params: dict) -> str:
         alerts = []
-        thresholds = self.config.alerts
-
         for chain in self.snapshot.chains:
             if chain.fetch_error:
                 alerts.append(f"[WARNING] {chain.chain} 데이터 조회 실패")
@@ -115,7 +194,6 @@ class ToolExecutor:
 
     def _generate_report(self, params: dict) -> str:
         report_type = params.get("type", "daily")
-        # 실제로는 Claude API를 다시 호출해서 리포트 텍스트 생성
         report_id = f"{report_type}_{self.snapshot.timestamp.strftime('%Y%m%d_%H%M')}"
         self._report_cache[report_id] = {
             "type": report_type,
@@ -128,7 +206,6 @@ class ToolExecutor:
         report_id = params.get("report_id", "")
         if not self.config.notion_api_key:
             return "Notion API 키 미설정 — 로컬 저장으로 대체"
-        # 실제: notion-client 라이브러리로 DB에 페이지 생성
         return f"Notion 저장 완료: {report_id}"
 
     def _send_telegram_alert(self, params: dict) -> str:
@@ -137,5 +214,4 @@ class ToolExecutor:
         if not self.config.telegram_token:
             print(f"[TELEGRAM MOCK — {level.upper()}] {message}")
             return f"텔레그램 전송 완료 (mock)"
-        # 실제: requests.post(f"https://api.telegram.org/bot{token}/sendMessage", ...)
         return f"텔레그램 알림 발송 완료 [{level}]"
