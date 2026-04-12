@@ -67,8 +67,8 @@ async def main():
                         help="Factor 10: controller(Multi-Agent) | single(단일 에이전트)")
     parser.add_argument("--resume",       metavar="RUN_ID",    help="중단된 실행 재개")
     parser.add_argument("--list-runs",    action="store_true", help="재개 가능한 실행 목록")
-    parser.add_argument("--context-format", choices=["xml", "plain"], default="xml",
-                        help="Factor 3: 컨텍스트 형식")
+    parser.add_argument("--context-format", choices=["xml", "plain", "single"], default="xml",
+                        help="Factor 3: 컨텍스트 형식 (single=원문 패턴)")
     args = parser.parse_args()
 
     store = EventStore()

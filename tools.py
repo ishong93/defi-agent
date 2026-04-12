@@ -29,20 +29,20 @@ class ValidationResult:
 # ── 파싱 ─────────────────────────────────────────────────────────
 
 def parse_tool_call(llm_output: str) -> dict:
-    """LLM 출력에서 도구 호출 파싱"""
+    """
+    LLM 출력에서 도구 호출 파싱.
+    Factor 7: LLM은 반드시 JSON만 출력해야 한다.
+    파싱 실패 시 프레임워크가 대신 의사결정하지 않고 에러를 발생시킨다.
+    """
     try:
         text = llm_output.strip()
         if "```" in text:
             text = text.split("```")[1].lstrip("json").strip()
         return json.loads(text)
     except Exception as e:
-        # 파싱 실패 → ask_human으로 폴백
-        return {
-            "tool": "ask_human",
-            "params": {"level": "info", "question": "LLM 응답 파싱 실패, 계속할까요?",
-                       "context": llm_output[:150]},
-            "reason": f"parse_error: {e}"
-        }
+        raise ValueError(
+            f"LLM JSON 파싱 실패: {e} | 출력: {llm_output[:150]}"
+        )
 
 
 # ── 검증 (Factor 4: Selection → Validation → Execution) ─────────

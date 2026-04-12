@@ -89,15 +89,30 @@ def run_sub_agent(
 
     # Sub-Agent 전용 derive_context — system_prompt를 오버라이드
     def _derive_with_custom_prompt(evts):
-        from prompts import XML_CONTEXT_TEMPLATES
-        fmt = XML_CONTEXT_TEMPLATES
-        messages = derive_context(evts, config.context.context_format)
-        # 첫 번째 메시지(기본 시스템 프롬프트)를 이 에이전트 전용으로 교체
-        if messages and messages[0]["role"] == "user":
-            if config.context.context_format == "xml":
+        fmt = config.context.context_format
+        # "single" 모드는 별도 처리 필요
+        if fmt == "single":
+            msgs = derive_context(evts, fmt)
+            if msgs and msgs[0]["role"] == "user":
+                # 시스템 프롬프트 부분만 교체
+                content = msgs[0]["content"]
+                import re
+                content = re.sub(
+                    r"<system_instruction>.*?</system_instruction>",
+                    f"<system_instruction>\n{system_prompt}\n</system_instruction>",
+                    content, count=1, flags=re.DOTALL
+                )
+                msgs[0]["content"] = content
+            return msgs
+
+        messages = derive_context(evts, fmt)
+        # 첫 번째 메시지(시스템 프롬프트)와 두 번째(assistant 확인)를 함께 교체
+        if len(messages) >= 2 and messages[0]["role"] == "user":
+            if fmt == "xml":
                 messages[0]["content"] = f"<system_instruction>\n{system_prompt}\n</system_instruction>"
             else:
                 messages[0]["content"] = system_prompt
+            messages[1]["content"] = "네, 지시에 따라 JSON만 반환하겠습니다."
         return messages
 
     collected_data = {}
@@ -111,7 +126,27 @@ def run_sub_agent(
 
             messages   = _derive_with_custom_prompt(events)
             raw_output = llm_fn(messages)
-            tool_call  = parse_tool_call(raw_output)
+
+            # Factor 7: JSON 파싱 실패 시 에러로 처리 (프레임워크가 대신 결정하지 않음)
+            try:
+                tool_call = parse_tool_call(raw_output)
+            except ValueError as e:
+                llm_event = LLMResponded(
+                    raw_output=raw_output, tool_name="__parse_error__",
+                    reason=str(e)[:200]
+                )
+                store.append(run_id, llm_event)
+                events.append(llm_event)
+                err = ToolFailed(
+                    tool_name="__parse_error__",
+                    error_type="JSONParseError",
+                    error_msg=f"JSON 형식 오류. JSON만 출력하세요. 원본: {raw_output[:100]}"
+                )
+                store.append(run_id, err)
+                events.append(err)
+                log.warning(f"[{agent_name}][{step+1}] JSON 파싱 실패")
+                continue
+
             tool_name  = tool_call.get("tool", "unknown")
 
             llm_event = LLMResponded(
@@ -195,15 +230,41 @@ def run_sub_agent(
                 store.append(run_id, err)
                 events.append(err)
 
+                # Factor 9: 연속 에러 에스컬레이션 (main loop과 동일 패턴)
                 consecutive = count_consecutive_errors(events)
                 if consecutive >= config.error_handling.max_consecutive_errors:
-                    log.error(f"[{agent_name}] 연속 에러 {consecutive}회 → 실패 처리")
-                    fail = AgentFailed(error=f"연속 에러 {consecutive}회: {e}")
-                    store.append(run_id, fail)
-                    return SubAgentResult(
-                        agent_name=agent_name, status="failed",
-                        error=str(e), run_id=run_id, steps=step + 1
-                    )
+                    if config.error_handling.escalate_to_human and human_input_fn:
+                        log.error(f"[{agent_name}] 연속 에러 {consecutive}회 → 사람 에스컬레이션")
+                        question = (
+                            f"[{agent_name}] 연속 {consecutive}회 에러. "
+                            f"마지막: {type(e).__name__}: {str(e)[:100]}. "
+                            f"계속할까요?"
+                        )
+                        asked = HumanAsked(level="critical", question=question,
+                                           context=f"연속 에러 {consecutive}회",
+                                           urgency="high", response_format="yes_no")
+                        store.append(run_id, asked)
+                        events.append(asked)
+                        answer = human_input_fn("critical", question,
+                                                f"연속 에러 {consecutive}회")
+                        resp = HumanResponded(answer=answer)
+                        store.append(run_id, resp)
+                        events.append(resp)
+                        if answer.lower() in ("아니오", "no", "n", "중단"):
+                            fail = AgentFailed(error=f"사용자가 중단: 연속 에러 {consecutive}회")
+                            store.append(run_id, fail)
+                            return SubAgentResult(
+                                agent_name=agent_name, status="failed",
+                                error=str(e), run_id=run_id, steps=step + 1
+                            )
+                    else:
+                        log.error(f"[{agent_name}] 연속 에러 {consecutive}회 → 실패 처리")
+                        fail = AgentFailed(error=f"연속 에러 {consecutive}회: {e}")
+                        store.append(run_id, fail)
+                        return SubAgentResult(
+                            agent_name=agent_name, status="failed",
+                            error=str(e), run_id=run_id, steps=step + 1
+                        )
 
         # max_steps 도달
         store.append(run_id, AgentFailed(error="max_steps_exceeded"))

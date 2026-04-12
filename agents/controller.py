@@ -23,7 +23,7 @@ from events import (TaskStarted, LLMResponded, ToolSucceeded, ToolFailed,
                     AgentCompleted, AgentFailed,
                     SubAgentStarted, SubAgentCompleted)
 from reducer import derive_context, should_compact, make_compaction_event
-from tools import parse_tool_call
+from tools import parse_tool_call, validate_tool_call, ValidationResult
 from event_store import EventStore
 from models import PortfolioSnapshot
 from config import AgentConfig
@@ -101,12 +101,29 @@ def run_controller(
 
     # Controller 전용 context 생성
     def _derive_controller_context(evts):
-        messages = derive_context(evts, config.context.context_format)
-        if messages and messages[0]["role"] == "user":
-            if config.context.context_format == "xml":
+        fmt = config.context.context_format
+        # "single" 모드는 별도 처리
+        if fmt == "single":
+            msgs = derive_context(evts, fmt)
+            if msgs and msgs[0]["role"] == "user":
+                import re
+                content = msgs[0]["content"]
+                content = re.sub(
+                    r"<system_instruction>.*?</system_instruction>",
+                    f"<system_instruction>\n{CONTROLLER_PROMPT}\n</system_instruction>",
+                    content, count=1, flags=re.DOTALL
+                )
+                msgs[0]["content"] = content
+            return msgs
+
+        messages = derive_context(evts, fmt)
+        # 시스템 프롬프트 + assistant 확인 메시지 함께 교체
+        if len(messages) >= 2 and messages[0]["role"] == "user":
+            if fmt == "xml":
                 messages[0]["content"] = f"<system_instruction>\n{CONTROLLER_PROMPT}\n</system_instruction>"
             else:
                 messages[0]["content"] = CONTROLLER_PROMPT
+            messages[1]["content"] = "네, Controller로서 JSON만 반환하고 Sub-Agent에게 위임하겠습니다."
         return messages
 
     # Controller 전용 도구: generate_report, send_telegram_alert, send_to_notion
@@ -124,7 +141,27 @@ def run_controller(
 
             messages   = _derive_controller_context(events)
             raw_output = llm_fn(messages)
-            tool_call  = parse_tool_call(raw_output)
+
+            # Factor 7: JSON 파싱 실패 시 에러로 처리
+            try:
+                tool_call = parse_tool_call(raw_output)
+            except ValueError as e:
+                llm_event = LLMResponded(
+                    raw_output=raw_output, tool_name="__parse_error__",
+                    reason=str(e)[:200]
+                )
+                store.append(run_id, llm_event)
+                events.append(llm_event)
+                err = ToolFailed(
+                    tool_name="__parse_error__",
+                    error_type="JSONParseError",
+                    error_msg=f"JSON 형식 오류. JSON만 출력하세요. 원본: {raw_output[:100]}"
+                )
+                store.append(run_id, err)
+                events.append(err)
+                log.warning(f"[Controller][{step+1}] JSON 파싱 실패")
+                continue
+
             tool_name  = tool_call.get("tool", "unknown")
 
             llm_event = LLMResponded(
@@ -215,7 +252,44 @@ def run_controller(
                 log.info(f"[Controller] ← [{agent_name}] {sub_result.status}: {sub_result.summary[:60]}")
                 continue
 
-            # ── 기타 도구 (generate_report, send_telegram_alert 등) ──
+            # ── Factor 4: 기타 도구도 검증 후 실행 ──────────────────
+            validation = validate_tool_call(tool_call, config)
+            if not validation.approved:
+                if validation.requires_human:
+                    question = validation.human_question or "도구 실행 승인이 필요합니다."
+                    asked = HumanAsked(level="warning", question=question,
+                                       context=json.dumps(tool_call, ensure_ascii=False))
+                    store.append(run_id, asked)
+                    events.append(asked)
+                    answer = human_input_fn("warning", question,
+                                            json.dumps(tool_call, ensure_ascii=False))
+                    resp = HumanResponded(answer=answer)
+                    store.append(run_id, resp)
+                    events.append(resp)
+                    if answer.lower() not in ("네", "yes", "승인", "확인", "y"):
+                        from events import ToolRejected
+                        reject = ToolRejected(
+                            tool_name=tool_name,
+                            reject_reason=f"사용자 거부: {answer}",
+                            original_params=json.dumps(tool_call.get("params", {}),
+                                                       ensure_ascii=False)
+                        )
+                        store.append(run_id, reject)
+                        events.append(reject)
+                        continue
+                else:
+                    from events import ToolRejected
+                    reject = ToolRejected(
+                        tool_name=tool_name,
+                        reject_reason=validation.reject_reason or "검증 실패",
+                        original_params=json.dumps(tool_call.get("params", {}),
+                                                   ensure_ascii=False)
+                    )
+                    store.append(run_id, reject)
+                    events.append(reject)
+                    log.warning(f"[Controller] 도구 거부: {tool_name} — {validation.reject_reason}")
+                    continue
+
             try:
                 result = executor.dispatch(tool_call)
                 ok_event = ToolSucceeded(tool_name=tool_name, result=result)

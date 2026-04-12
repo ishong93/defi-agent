@@ -106,7 +106,27 @@ def run_agent(
             # ── Step 1: LLM 호출 (Selection) ─────────────────────
             messages   = derive_context(events, config.context.context_format)
             raw_output = llm_fn(messages)
-            tool_call  = parse_tool_call(raw_output)
+
+            # Factor 7: LLM은 반드시 JSON만 출력 — 파싱 실패 시 에러로 처리
+            try:
+                tool_call = parse_tool_call(raw_output)
+            except ValueError as e:
+                llm_event = LLMResponded(
+                    raw_output=raw_output, tool_name="__parse_error__",
+                    reason=str(e)[:200]
+                )
+                store.append(run_id, llm_event)
+                events.append(llm_event)
+                err = ToolFailed(
+                    tool_name="__parse_error__",
+                    error_type="JSONParseError",
+                    error_msg=f"JSON 형식 오류. JSON만 출력하세요. 원본: {raw_output[:100]}"
+                )
+                store.append(run_id, err)
+                events.append(err)
+                log.warning(f"[{step+1}] JSON 파싱 실패 — LLM에게 재시도 요청")
+                continue
+
             tool_name  = tool_call.get("tool", "unknown")
 
             # Factor 6: LLM 응답을 실행 전에 기록 (Selection/Execution 분리)

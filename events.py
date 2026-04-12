@@ -86,11 +86,16 @@ class ToolFailed(BaseEvent):
 
 @dataclass(frozen=True)
 class HumanAsked(BaseEvent):
-    """에이전트가 사람에게 확인을 요청함 (Factor 7: Outer Loop)"""
-    kind:     Literal["HumanAsked"] = "HumanAsked"
-    level:    str = "info"           # info | warning | critical
-    question: str = ""
-    context:  str = ""
+    """
+    에이전트가 사람에게 확인을 요청함 (Factor 7: Outer Loop).
+    Factor 7 원문: RequestHumanInput에 urgency, format 포함.
+    """
+    kind:            Literal["HumanAsked"] = "HumanAsked"
+    level:           str = "info"           # info | warning | critical
+    question:        str = ""
+    context:         str = ""
+    urgency:         str = "medium"         # low | medium | high
+    response_format: str = "free_text"      # free_text | yes_no | multiple_choice
 
 
 @dataclass(frozen=True)
