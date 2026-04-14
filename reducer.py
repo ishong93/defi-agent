@@ -148,7 +148,9 @@ def _find_resolved_errors(events: list[AgentEvent]) -> set[int]:
         event = events[i]
         if isinstance(event, ToolSucceeded):
             succeeded_tools.add(event.tool_name)
-        elif isinstance(event, ToolFailed) and event.tool_name in succeeded_tools:
+        # Mark ToolFailed and ToolRejected events as resolved if the same tool later succeeded,
+        # so that resolved errors are removed from context and do not confuse the LLM.
+        elif (isinstance(event, (ToolFailed, ToolRejected)) and event.tool_name in succeeded_tools):
             resolved.add(i)
     return resolved
 
