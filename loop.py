@@ -30,13 +30,49 @@ log = setup_logger("loop")
 LLMCallFn = Callable[[list], str]
 
 
-def make_anthropic_llm(model: str) -> LLMCallFn:
-    """Claude API 호출 함수 팩토리"""
+def make_anthropic_llm(model: str, enable_prompt_cache: bool = True) -> LLMCallFn:
+    """
+    Claude API 호출 함수 팩토리.
+
+    enable_prompt_cache=True (기본):
+      첫 메시지(시스템 프롬프트 + 초기 포트폴리오 스냅샷 포함)에
+      cache_control={"type": "ephemeral"}을 적용.
+      동일 run 내 반복 호출 시 해당 프리픽스의 입력 토큰 비용을
+      최대 90% 절감 (5분 TTL). 캐시 미스 시 정상 동작.
+    """
     client = anthropic.Anthropic()
+
     def call(messages):
-        response = client.messages.create(model=model, max_tokens=1024, messages=messages)
+        if enable_prompt_cache and messages:
+            messages = _mark_prefix_for_cache(messages)
+        response = client.messages.create(
+            model=model, max_tokens=1024, messages=messages
+        )
         return response.content[0].text
     return call
+
+
+def _mark_prefix_for_cache(messages: list) -> list:
+    """
+    첫 user 메시지를 캐시 블록 형태로 변환. 나머지 메시지는 그대로.
+    reducer.derive_context()는 첫 메시지에 SYSTEM_PROMPT를 넣으므로,
+    이 프리픽스는 run 동안 변하지 않아 캐시 히트율이 높다.
+    """
+    if not messages:
+        return messages
+    first = messages[0]
+    content = first.get("content")
+    if isinstance(content, str):
+        cached_first = {
+            "role": first["role"],
+            "content": [{
+                "type": "text",
+                "text": content,
+                "cache_control": {"type": "ephemeral"},
+            }],
+        }
+        return [cached_first] + messages[1:]
+    return messages
 
 
 def run_agent(
