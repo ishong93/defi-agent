@@ -9,7 +9,7 @@
 
 import json
 from datetime import datetime, timezone
-from typing import Callable, Optional
+from typing import Callable, Optional, TypedDict
 import anthropic
 
 from events import (TaskStarted, SnapshotRefreshed, LLMResponded,
@@ -27,7 +27,13 @@ from logger import setup_logger, new_run_id
 log = setup_logger("loop")
 
 # Factor 12: LLM 호출을 추상화 — 테스트 시 ScriptedLLM으로 교체 가능
-LLMCallFn = Callable[[list], str]
+class Message(TypedDict):
+    """Anthropic API 호환 메시지 형식 (content는 str 또는 블록 list)."""
+    role: str        # "user" | "assistant"
+    content: object  # str | list[dict] (cache_control 적용 시)
+
+
+LLMCallFn = Callable[[list[Message]], str]
 
 
 def make_anthropic_llm(model: str, enable_prompt_cache: bool = True) -> LLMCallFn:
@@ -208,45 +214,14 @@ def run_agent(
 
             # ── Step 2: 검증 (Factor 4: 도구 호출 = 제안) ────────
             validation = validate_tool_call(tool_call, config)
-
             if not validation.approved:
-                if validation.requires_human:
-                    # 사람 확인 필요 → ask_human 흐름으로 전환
-                    question = validation.human_question or "도구 실행 승인이 필요합니다."
-                    asked = HumanAsked(level="warning", question=question,
-                                       context=json.dumps(tool_call, ensure_ascii=False))
-                    store.append(run_id, asked)
-                    events.append(asked)
-                    answer = human_input_fn("warning", question,
-                                            json.dumps(tool_call, ensure_ascii=False))
-                    resp = HumanResponded(answer=answer)
-                    store.append(run_id, resp)
-                    events.append(resp)
-
-                    # 승인되면 실행, 아니면 거부
-                    if answer.lower() not in ("네", "yes", "승인", "확인", "y"):
-                        reject = ToolRejected(
-                            tool_name=tool_name,
-                            reject_reason=f"사용자 거부: {answer}",
-                            original_params=json.dumps(tool_call.get("params", {}),
-                                                       ensure_ascii=False)
-                        )
-                        store.append(run_id, reject)
-                        events.append(reject)
-                        continue
-                    # 승인됨 → 아래 실행 단계로 진행
-                else:
-                    # 자동 거부 (한도 초과 등)
-                    reject = ToolRejected(
-                        tool_name=tool_name,
-                        reject_reason=validation.reject_reason or "검증 실패",
-                        original_params=json.dumps(tool_call.get("params", {}),
-                                                   ensure_ascii=False)
-                    )
-                    store.append(run_id, reject)
-                    events.append(reject)
-                    log.warning(f"도구 거부: {tool_name} — {validation.reject_reason}")
+                approved_by_human = _handle_rejection(
+                    validation, tool_call, tool_name,
+                    run_id, store, events, human_input_fn,
+                )
+                if not approved_by_human:
                     continue
+                # 사람이 승인 → 아래 실행 단계로 진행
 
             # ── Step 3: 실행 (Execution) ─────────────────────────
             try:
@@ -256,34 +231,10 @@ def run_agent(
                 events.append(ok_event)
                 log.debug(f"도구 성공: {tool_name}")
             except Exception as e:
-                err = ToolFailed(
-                    tool_name=tool_name,
-                    error_type=type(e).__name__,
-                    error_msg=str(e)[:config.error_handling.max_error_msg_len]
+                _handle_tool_error(
+                    e, tool_name, run_id, store, events,
+                    human_input_fn, config,
                 )
-                store.append(run_id, err)
-                events.append(err)
-                log.warning(f"도구 실패: {tool_name} — {e}")
-
-                # ── Factor 9: 연속 에러 에스컬레이션 ─────────────
-                consecutive = count_consecutive_errors(events)
-                if (consecutive >= config.error_handling.max_consecutive_errors
-                        and config.error_handling.escalate_to_human):
-                    log.error(f"연속 에러 {consecutive}회 → 사람 에스컬레이션")
-                    question = (
-                        f"연속 {consecutive}회 에러 발생. "
-                        f"마지막 에러: {type(e).__name__}: {str(e)[:100]}. "
-                        f"계속 진행할까요?"
-                    )
-                    asked = HumanAsked(level="critical", question=question,
-                                       context=f"연속 에러 {consecutive}회")
-                    store.append(run_id, asked)
-                    events.append(asked)
-                    answer = human_input_fn("critical", question,
-                                            f"연속 에러 {consecutive}회")
-                    resp = HumanResponded(answer=answer)
-                    store.append(run_id, resp)
-                    events.append(resp)
 
         # max_steps 도달
         fail = AgentFailed(error="max_steps_exceeded")
@@ -298,6 +249,90 @@ def run_agent(
         store.append(run_id, AgentFailed(error=str(e)))
         log.exception(f"예외: {e}")
         raise
+
+
+_HUMAN_APPROVAL_WORDS = {"네", "yes", "승인", "확인", "y"}
+
+
+def _handle_rejection(validation, tool_call: dict, tool_name: str,
+                      run_id: str, store: EventStore, events: list,
+                      human_input_fn: Callable) -> bool:
+    """
+    검증 실패 처리. 반환값은 "최종적으로 실행을 진행할지".
+    - requires_human=True + 사람이 승인 → True (실행 진행)
+    - requires_human=True + 사람이 거부 → False (ToolRejected 기록, continue)
+    - requires_human=False → False (자동 거부, ToolRejected 기록, continue)
+    """
+    params_json = json.dumps(tool_call.get("params", {}), ensure_ascii=False)
+
+    if not validation.requires_human:
+        reject = ToolRejected(
+            tool_name=tool_name,
+            reject_reason=validation.reject_reason or "검증 실패",
+            original_params=params_json,
+        )
+        store.append(run_id, reject)
+        events.append(reject)
+        log.warning(f"도구 거부: {tool_name} — {validation.reject_reason}")
+        return False
+
+    question = validation.human_question or "도구 실행 승인이 필요합니다."
+    tool_json = json.dumps(tool_call, ensure_ascii=False)
+    asked = HumanAsked(level="warning", question=question, context=tool_json)
+    store.append(run_id, asked)
+    events.append(asked)
+    answer = human_input_fn("warning", question, tool_json)
+    resp = HumanResponded(answer=answer)
+    store.append(run_id, resp)
+    events.append(resp)
+
+    if answer.strip().lower() in _HUMAN_APPROVAL_WORDS:
+        return True
+
+    reject = ToolRejected(
+        tool_name=tool_name,
+        reject_reason=f"사용자 거부: {answer}",
+        original_params=params_json,
+    )
+    store.append(run_id, reject)
+    events.append(reject)
+    return False
+
+
+def _handle_tool_error(e: Exception, tool_name: str, run_id: str,
+                       store: EventStore, events: list,
+                       human_input_fn: Callable, config: AgentConfig) -> None:
+    """
+    도구 실행 실패 기록 + Factor 9 연속 에러 에스컬레이션.
+    """
+    err = ToolFailed(
+        tool_name=tool_name,
+        error_type=type(e).__name__,
+        error_msg=str(e)[:config.error_handling.max_error_msg_len],
+    )
+    store.append(run_id, err)
+    events.append(err)
+    log.warning(f"도구 실패: {tool_name} — {e}")
+
+    consecutive = count_consecutive_errors(events)
+    if not (consecutive >= config.error_handling.max_consecutive_errors
+            and config.error_handling.escalate_to_human):
+        return
+
+    log.error(f"연속 에러 {consecutive}회 → 사람 에스컬레이션")
+    question = (
+        f"연속 {consecutive}회 에러 발생. "
+        f"마지막 에러: {type(e).__name__}: {str(e)[:100]}. "
+        f"계속 진행할까요?"
+    )
+    ctx = f"연속 에러 {consecutive}회"
+    asked = HumanAsked(level="critical", question=question, context=ctx)
+    store.append(run_id, asked)
+    events.append(asked)
+    answer = human_input_fn("critical", question, ctx)
+    resp = HumanResponded(answer=answer)
+    store.append(run_id, resp)
+    events.append(resp)
 
 
 def _check_snapshot_staleness(events: list, config: AgentConfig) -> int:
