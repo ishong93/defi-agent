@@ -143,16 +143,11 @@ class ToolExecutor:
         return self.snapshot.to_context_summary()
 
     def _fetch_price_history(self, params: dict) -> str:
+        from shared_mocks import price_change_pct
         asset = params.get("asset", "FLR")
         days = params.get("days", 7)
         # 실제: CoinGecko API 호출
-        mock_data = {
-            "FLR": [0.0192, 0.0188, 0.0185, 0.0179, 0.0183, 0.0186, 0.0185],
-            "XDC": [0.0445, 0.0441, 0.0438, 0.0432, 0.0435, 0.0433, 0.0432],
-            "XRP": [2.35, 2.28, 2.25, 2.19, 2.22, 2.28, 2.31],
-        }
-        prices = mock_data.get(asset, [])
-        change = ((prices[-1] - prices[0]) / prices[0] * 100) if prices else 0
+        prices, change = price_change_pct(asset)
         return f"{asset} {days}일 가격 추이: {prices}\n변동률: {change:+.2f}%"
 
     def _fetch_defi_yields(self, params: dict) -> str:

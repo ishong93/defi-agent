@@ -25,35 +25,45 @@ def with_retry(
             ...
     """
     def decorator(fn: Callable):
-        @functools.wraps(fn)
-        async def async_wrapper(*args, **kwargs):
-            last_exc = None
-            for attempt in range(1, max_attempts + 1):
-                try:
-                    return await fn(*args, **kwargs)
-                except exceptions as e:
-                    last_exc = e
-                    if attempt == max_attempts:
-                        log.error(f"{fn.__name__} 최종 실패 (시도 {attempt}/{max_attempts})",
-                                  extra={"fn": fn.__name__, "attempt": attempt, "error": str(e)})
-                        raise
-                    delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
-                    log.warning(f"{fn.__name__} 실패 → {delay:.1f}초 후 재시도 ({attempt}/{max_attempts}): {e}",
-                                extra={"fn": fn.__name__, "attempt": attempt, "delay": delay})
-                    await asyncio.sleep(delay)
+        if asyncio.iscoroutinefunction(fn):
+            @functools.wraps(fn)
+            async def async_wrapper(*args, **kwargs):
+                for attempt in range(1, max_attempts + 1):
+                    try:
+                        return await fn(*args, **kwargs)
+                    except exceptions as e:
+                        delay = _handle_retry(fn.__name__, attempt, max_attempts, e)
+                        if delay is None:
+                            raise
+                        await asyncio.sleep(delay)
+            return async_wrapper
 
         @functools.wraps(fn)
         def sync_wrapper(*args, **kwargs):
-            last_exc = None
             for attempt in range(1, max_attempts + 1):
                 try:
                     return fn(*args, **kwargs)
                 except exceptions as e:
-                    last_exc = e
-                    if attempt == max_attempts:
+                    delay = _handle_retry(fn.__name__, attempt, max_attempts, e)
+                    if delay is None:
                         raise
-                    delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
                     time.sleep(delay)
+        return sync_wrapper
 
-        return async_wrapper if asyncio.iscoroutinefunction(fn) else sync_wrapper
+    def _handle_retry(fn_name: str, attempt: int, max_attempts: int,
+                      e: Exception) -> float | None:
+        """재시도 결정 로직 — sync/async 공통. None 반환 시 최종 실패."""
+        if attempt == max_attempts:
+            log.error(
+                f"{fn_name} 최종 실패 (시도 {attempt}/{max_attempts})",
+                extra={"fn": fn_name, "attempt": attempt, "error": str(e)},
+            )
+            return None
+        delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
+        log.warning(
+            f"{fn_name} 실패 → {delay:.1f}초 후 재시도 ({attempt}/{max_attempts}): {e}",
+            extra={"fn": fn_name, "attempt": attempt, "delay": delay},
+        )
+        return delay
+
     return decorator
