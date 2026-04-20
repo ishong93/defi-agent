@@ -38,12 +38,19 @@ LLMUsage = dict  # {input_tokens, output_tokens, cache_read_tokens, cache_creati
 LLMCallFn = Callable[[list[Message]], "str | tuple[str, LLMUsage]"]
 
 
-def make_anthropic_llm(model: str, enable_prompt_cache: bool = True) -> LLMCallFn:
+def make_anthropic_llm(model: str, enable_prompt_cache: bool = True,
+                       use_native_tools: bool = True) -> LLMCallFn:
     """
     Claude API 호출 함수 팩토리.
 
     반환 계약: (text, usage_dict) 튜플. usage_dict는 input/output/cache 토큰 수.
     하위 호환을 위해 loop.py에서 문자열만 반환하는 레거시 LLM도 허용한다.
+
+    use_native_tools=True (기본):
+      Anthropic tools 파라미터로 TOOL_SCHEMAS를 전달. 모델은 tool_use 블록으로
+      응답하고, 이를 기존 {"tool","params","reason"} JSON 텍스트로 직렬화해
+      parse_tool_call 파이프라인과 호환을 유지한다. 프롬프트 지시만으로 JSON을
+      강제하던 것과 달리 API 레벨에서 스키마 위반이 원천 차단된다.
 
     enable_prompt_cache=True (기본):
       첫 메시지(시스템 프롬프트 + 초기 포트폴리오 스냅샷 포함)에
@@ -56,9 +63,11 @@ def make_anthropic_llm(model: str, enable_prompt_cache: bool = True) -> LLMCallF
     def call(messages):
         if enable_prompt_cache and messages:
             messages = _mark_prefix_for_cache(messages)
-        response = client.messages.create(
-            model=model, max_tokens=1024, messages=messages
-        )
+        kwargs = {"model": model, "max_tokens": 1024, "messages": messages}
+        if use_native_tools:
+            from tool_schemas import TOOL_SCHEMAS
+            kwargs["tools"] = TOOL_SCHEMAS
+        response = client.messages.create(**kwargs)
         u = response.usage
         usage = {
             "input_tokens": getattr(u, "input_tokens", 0) or 0,
@@ -66,8 +75,38 @@ def make_anthropic_llm(model: str, enable_prompt_cache: bool = True) -> LLMCallF
             "cache_read_tokens": getattr(u, "cache_read_input_tokens", 0) or 0,
             "cache_creation_tokens": getattr(u, "cache_creation_input_tokens", 0) or 0,
         }
-        return response.content[0].text, usage
+        text = _extract_text_from_response(response, use_native_tools)
+        return text, usage
     return call
+
+
+def _extract_text_from_response(response, use_native_tools: bool) -> str:
+    """
+    Anthropic 응답을 parse_tool_call이 읽을 수 있는 JSON 텍스트로 정규화.
+
+    - tool_use 블록이 있으면 {"tool", "params", "reason"} 형태로 직렬화.
+      reason은 함께 반환된 text 블록이 있으면 채운다 (Claude의 사고 과정).
+    - tool_use가 없으면 text 블록 그대로 반환 (JSON-in-text 레거시 경로).
+    """
+    if not use_native_tools:
+        return response.content[0].text
+
+    text_reason = ""
+    tool_use = None
+    for block in response.content:
+        btype = getattr(block, "type", None)
+        if btype == "text":
+            text_reason = (text_reason + " " + block.text).strip()
+        elif btype == "tool_use":
+            tool_use = block
+    if tool_use is None:
+        return response.content[0].text if response.content else ""
+    payload = {
+        "tool": tool_use.name,
+        "params": dict(tool_use.input or {}),
+        "reason": text_reason,
+    }
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def _invoke_llm(llm_fn: LLMCallFn, messages: list) -> tuple[str, dict]:
