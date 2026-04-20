@@ -1,6 +1,10 @@
 # data_fetchers/xdc_fetcher.py — XDC Network + PrimeStaking
+#
+# 실제 지갑 주소면 web3.py / CoinGecko 호출, placeholder거나 실패 시 mock 폴백.
 
 from models import ChainPortfolio, StakingPosition
+from ._helpers import is_placeholder_wallet, run_blocking, log
+from .price_provider import fetch_price_usd
 
 
 async def fetch_xdc_portfolio(wallet_address: str, rpc_url: str) -> ChainPortfolio:
@@ -39,14 +43,34 @@ async def fetch_xdc_portfolio(wallet_address: str, rpc_url: str) -> ChainPortfol
         )
 
 
+def _web3_get_balance(rpc_url: str, address: str) -> float:
+    """XDC는 EVM 호환. `xdc...` 주소는 `0x...` 로 변환하여 조회."""
+    from web3 import Web3
+    if address.startswith("xdc"):
+        address = "0x" + address[3:]
+    w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 5}))
+    balance_wei = w3.eth.get_balance(Web3.to_checksum_address(address))
+    return float(Web3.from_wei(balance_wei, "ether"))
+
+
 async def _get_xdc_balance(address: str, rpc_url: str) -> float:
-    return 8500.0  # Mock
+    if is_placeholder_wallet(address) or not rpc_url:
+        return 8500.0
+    try:
+        return await run_blocking(_web3_get_balance, rpc_url, address)
+    except Exception as e:
+        log.warning(f"XDC RPC 실패, mock 폴백: {type(e).__name__}: {e}")
+        return 8500.0
+
 
 async def _get_xdc_price_usd() -> float:
-    return 0.0432  # Mock
+    price = await fetch_price_usd("XDC")
+    return price if price is not None else 0.0432
+
 
 async def _get_primestaking_position(wallet: str) -> dict:
     # PrimeStaking API: https://primestaking.net/api/delegator/{wallet}
+    # 현재는 mock. placeholder 주소든 실제 주소든 동일 값 반환.
     return {
         "delegated_amount": 50000.0,
         "apy": 12.5,

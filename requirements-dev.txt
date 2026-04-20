@@ -1,0 +1,5 @@
+# 개발/테스트 전용 의존성 (운영 이미지에는 포함 안 함)
+-r requirements.txt
+
+pytest>=9.0.0
+pytest-asyncio>=0.24.0  # test_integration.py의 async 테스트용

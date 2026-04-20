@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run pytest
+        env:
+          # ANTHROPIC_API_KEY는 테스트에서 실제로 호출되지 않음 (ScriptedLLM 사용).
+          # config.py가 load_dotenv로 읽어오려 할 때 비어있어도 동작하지만,
+          # Anthropic 클라이언트 초기화 경로에선 더미 값이 있는 게 안전.
+          ANTHROPIC_API_KEY: dummy-for-ci
+        run: pytest tests/ -v
+
+      - name: Run E2E verification
+        env:
+          ANTHROPIC_API_KEY: dummy-for-ci
+        run: python e2e_verify.py
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t defi-agent:ci .
