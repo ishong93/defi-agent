@@ -364,9 +364,23 @@ class TestDataFetchers:
 
     @pytest.mark.asyncio
     async def test_flare_fetcher_returns_chain_portfolio(self):
+        from unittest.mock import AsyncMock, patch
         from data_fetchers.flare_fetcher import fetch_flare_portfolio
+        from data_fetchers import price_feed
         from models import ChainPortfolio
-        result = await fetch_flare_portfolio("0xTEST", "https://mock-rpc")
+        import time
+
+        price_feed._cache["FLR"] = (0.02, time.monotonic() + 60)
+        price_feed._cache["XRP"] = (2.30, time.monotonic() + 60)
+
+        with patch("data_fetchers.flare_fetcher._get_native_balance",
+                   new=AsyncMock(return_value=1250.5)), \
+             patch("data_fetchers.flare_fetcher._get_stxrp_position",
+                   new=AsyncMock(return_value={"shares": 500.0, "assets": 521.5, "apy": 8.7})), \
+             patch("data_fetchers.flare_fetcher._get_sparkdex_lp_positions",
+                   new=AsyncMock(return_value=[])):
+            result = await fetch_flare_portfolio("0xTEST", "https://mock-rpc")
+
         assert isinstance(result, ChainPortfolio)
         assert result.chain == "Flare"
         assert result.native_balance > 0
@@ -374,8 +388,21 @@ class TestDataFetchers:
 
     @pytest.mark.asyncio
     async def test_xdc_fetcher_returns_staking_positions(self):
+        from unittest.mock import AsyncMock, patch
         from data_fetchers.xdc_fetcher import fetch_xdc_portfolio
-        result = await fetch_xdc_portfolio("0xXDC_TEST", "https://mock-rpc")
+        from data_fetchers import price_feed
+        import time
+
+        price_feed._cache["XDC"] = (0.043, time.monotonic() + 60)
+        staking = {"delegated_amount": 50000.0, "apy": 12.5,
+                   "pending_rewards": 625.0, "epoch_end": "2025-06-30"}
+
+        with patch("data_fetchers.xdc_fetcher._get_xdc_balance",
+                   new=AsyncMock(return_value=8500.0)), \
+             patch("data_fetchers.xdc_fetcher._get_primestaking_position",
+                   new=AsyncMock(return_value=staking)):
+            result = await fetch_xdc_portfolio("xdc1234abcd", "https://mock-rpc")
+
         assert result.chain == "XDC"
         assert len(result.staking_positions) > 0
         assert result.staking_positions[0].protocol == "PrimeStaking"

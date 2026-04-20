@@ -9,14 +9,16 @@ ScriptedLLM으로 LLM 레이어를 대체해 실제 흐름 전체를 돌린다.
   4. 도구 거부 흐름 (Factor 4)
   5. Multi-Agent: Controller → Sub-Agent 오케스트레이션 (Factor 10)
 """
-import asyncio, tempfile
+import asyncio, tempfile, time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 from data_fetchers.flare_fetcher import fetch_flare_portfolio
 from data_fetchers.xdc_fetcher   import fetch_xdc_portfolio
-from models      import PortfolioSnapshot
+from data_fetchers import price_feed
+from models      import PortfolioSnapshot, DeFiPosition
 from config      import AgentConfig
 from loop        import run_agent
 from agents.controller import run_controller
@@ -45,12 +47,34 @@ async def main():
 
     config = AgentConfig()
 
-    # ── 1. 온체인 데이터 병렬 수집 ───────────────────────────────
+    # ── 1. 온체인 데이터 병렬 수집 (네트워크 호출은 mock) ────────
     print("\n[1/5] 온체인 데이터 병렬 수집...")
-    flare, xdc = await asyncio.gather(
-        fetch_flare_portfolio("0xTEST_FLARE", config.chains.flare_rpc),
-        fetch_xdc_portfolio("0xTEST_XDC",    config.chains.xdc_rpc),
-    )
+    # CoinGecko/RPC 네트워크를 건너뛰고 고정값으로 전체 흐름만 검증
+    price_feed._cache.update({
+        "FLR": (0.0185, time.monotonic() + 300),
+        "XDC": (0.0432, time.monotonic() + 300),
+        "XRP": (2.31,   time.monotonic() + 300),
+    })
+    lp = [DeFiPosition(protocol="SparkDEX", position_type="LP",
+                       assets=["FXRP", "FLR"], value_usd=340.20,
+                       pnl_usd=12.50, share_pct=0.0023)]
+    staking_xdc = {"delegated_amount": 50000.0, "apy": 12.5,
+                   "pending_rewards": 625.0, "epoch_end": "2025-06-30"}
+
+    with patch("data_fetchers.flare_fetcher._get_native_balance",
+               new=AsyncMock(return_value=1250.5)), \
+         patch("data_fetchers.flare_fetcher._get_stxrp_position",
+               new=AsyncMock(return_value={"shares": 500.0, "assets": 521.5, "apy": 8.7})), \
+         patch("data_fetchers.flare_fetcher._get_sparkdex_lp_positions",
+               new=AsyncMock(return_value=lp)), \
+         patch("data_fetchers.xdc_fetcher._get_xdc_balance",
+               new=AsyncMock(return_value=8500.0)), \
+         patch("data_fetchers.xdc_fetcher._get_primestaking_position",
+               new=AsyncMock(return_value=staking_xdc)):
+        flare, xdc = await asyncio.gather(
+            fetch_flare_portfolio("0xTEST_FLARE", config.chains.flare_rpc),
+            fetch_xdc_portfolio("0xTEST_XDC",    config.chains.xdc_rpc),
+        )
 
     assert flare.chain == "Flare" and flare.fetch_error is None
     assert xdc.chain   == "XDC"   and xdc.fetch_error   is None
