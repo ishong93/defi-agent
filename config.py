@@ -49,7 +49,9 @@ class ErrorHandlingConfig:
 class ContextConfig:
     """Factor 3/10: 컨텍스트 관리 설정"""
     max_context_messages: int = 20          # 컨텍스트 최대 메시지 수
-    context_format: str = "xml"             # "xml" | "plain" | "single" (Factor 3: 커스텀 형식)
+    # Phase 5: "native" 가 기본 — Anthropic content-block + system= 파라미터 사용 (Role Hacking 제거).
+    # "xml" | "plain" | "single" 은 레거시 JSON-in-text 경로 (ScriptedLLM 테스트 호환).
+    context_format: str = "native"
     step_warning_threshold: int = 10        # Factor 10: 이 스텝 수 이후 경고
     snapshot_stale_minutes: int = 30        # Factor 6: 스냅샷 신선도 임계값 (분)
 

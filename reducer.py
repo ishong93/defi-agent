@@ -22,6 +22,7 @@
 #   - 연속 에러 경고를 context에 삽입
 
 from __future__ import annotations
+import json
 from events import (AgentEvent, TaskStarted, SnapshotRefreshed,
                     LLMResponded, ToolRejected, ToolSucceeded,
                     ToolFailed, HumanAsked, HumanResponded, ContextCompacted,
@@ -349,3 +350,194 @@ def _derive_single_message(events: list[AgentEvent]) -> list[dict]:
     parts.append("\nWhat should the next step be?")
 
     return [{"role": "user", "content": "\n\n".join(parts)}]
+
+
+# ── Phase 5: Native Anthropic content-block 포맷 ────────────────────
+
+def derive_native_context(events: list[AgentEvent]) -> tuple[str, list[dict]]:
+    """
+    Phase 5 — 진짜 네이티브 Anthropic tool_use 프로토콜로 컨텍스트 생성.
+
+    반환: (system_prompt, messages)
+      - system_prompt: messages.create(system=...) 로 전달 (Role Hacking 제거)
+      - messages: content block 배열 (text / tool_use / tool_result)
+
+    왕복 매칭:
+      LLMResponded(tool_use_id=X) → assistant [text?, tool_use id=X]
+      바로 다음 ToolSucceeded/Failed/Rejected → user [tool_result tool_use_id=X]
+    """
+    resolved = _find_resolved_errors(events)
+    messages: list[dict] = []
+    pending_tool_use_id: str = ""
+    pending_tool_name: str = ""
+
+    def _flush_pending_as_error(reason: str):
+        """LLM이 tool_use를 낸 뒤 결과 없이 다음 assistant 메시지가 오면 에러로 채움."""
+        nonlocal pending_tool_use_id, pending_tool_name
+        if pending_tool_use_id:
+            messages.append({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": pending_tool_use_id,
+                    "content": reason,
+                    "is_error": True,
+                }],
+            })
+            pending_tool_use_id = ""
+            pending_tool_name = ""
+
+    for i, event in enumerate(events):
+        match event:
+
+            case TaskStarted(task=task, portfolio_summary=summary):
+                messages.append({
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": (
+                            f"<portfolio_snapshot>\n{summary}\n</portfolio_snapshot>\n\n"
+                            f"<task>{_task_description(task)}</task>"
+                        ),
+                    }],
+                })
+
+            case SnapshotRefreshed(portfolio_summary=summary, stale_minutes=stale):
+                _flush_pending_as_error("snapshot refreshed before tool result")
+                messages.append({
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": f"<snapshot_refreshed stale_minutes=\"{stale}\">\n{summary}\n</snapshot_refreshed>",
+                    }],
+                })
+
+            case LLMResponded(tool_use_id=tu_id, tool_name=name,
+                              tool_params=params_json, reason=reason,
+                              raw_output=raw):
+                # tool_use_id 가 비어 있으면(= 레거시 JSON-in-text 경로) 스킵.
+                # native 경로에서는 항상 채워진다.
+                if not tu_id or not name:
+                    continue
+                _flush_pending_as_error("new assistant turn before previous tool_result")
+
+                blocks: list[dict] = []
+                if reason:
+                    blocks.append({"type": "text", "text": reason})
+                blocks.append({
+                    "type": "tool_use",
+                    "id": tu_id,
+                    "name": name,
+                    "input": _loads_safe(params_json),
+                })
+                messages.append({"role": "assistant", "content": blocks})
+                pending_tool_use_id = tu_id
+                pending_tool_name = name
+
+            case ToolSucceeded(tool_name=name, result=result):
+                if pending_tool_use_id:
+                    messages.append({
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": pending_tool_use_id,
+                            "content": result,
+                        }],
+                    })
+                    pending_tool_use_id = ""
+                    pending_tool_name = ""
+
+            case ToolFailed(tool_name=name, error_type=etype, error_msg=emsg):
+                # Factor 9: 이후 같은 도구가 성공했다면 이 에러는 빼고,
+                # tool_use_id 매칭만 닫아준다 (Anthropic API는 반드시 짝 필요).
+                skip = i in resolved
+                if pending_tool_use_id:
+                    content = (
+                        f"(resolved by later success)" if skip
+                        else f"{etype}: {emsg[:MAX_ERROR_LEN]}"
+                    )
+                    messages.append({
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": pending_tool_use_id,
+                            "content": content,
+                            "is_error": not skip,
+                        }],
+                    })
+                    pending_tool_use_id = ""
+                    pending_tool_name = ""
+
+            case ToolRejected(tool_name=name, reject_reason=reason,
+                              original_params=params):
+                if pending_tool_use_id:
+                    messages.append({
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": pending_tool_use_id,
+                            "content": f"거부됨: {reason} | 파라미터: {params}",
+                            "is_error": True,
+                        }],
+                    })
+                    pending_tool_use_id = ""
+                    pending_tool_name = ""
+
+            case HumanAsked():
+                pass  # ask_human 은 LLMResponded 에 이미 tool_use 로 있음
+
+            case HumanResponded(answer=answer):
+                # 두 종류가 있다:
+                # (a) ask_human 툴 응답 → pending tool_use 를 tool_result 로 닫는다.
+                # (b) 도구 승인/거부 또는 에러 에스컬레이션 응답 → 텍스트 메모로 남김.
+                #     (실제 tool_result 는 이어지는 ToolSucceeded/Failed/Rejected 가 생성)
+                if pending_tool_use_id and pending_tool_name == "ask_human":
+                    messages.append({
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": pending_tool_use_id,
+                            "content": answer,
+                        }],
+                    })
+                    pending_tool_use_id = ""
+                    pending_tool_name = ""
+                elif not pending_tool_use_id:
+                    messages.append({
+                        "role": "user",
+                        "content": [{"type": "text",
+                                     "text": f"[사용자 응답] {answer}"}],
+                    })
+
+            case SubAgentStarted():
+                pass
+
+            case SubAgentCompleted(agent_name=name, status=st, summary=summ):
+                _flush_pending_as_error("sub-agent completion before tool result")
+                messages.append({
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": f"<sub_agent_result agent=\"{name}\" status=\"{st}\">\n{summ}\n</sub_agent_result>",
+                    }],
+                })
+
+            case ContextCompacted():
+                pass  # 네이티브 경로는 아래에서 별도 처리
+
+    # Anthropic API 불변조건: 마지막 assistant 가 tool_use 라면 짝을 반드시 닫아야 함.
+    # 루프 종료 시점에 미완 tool_use 가 남아 있으면 플레이스홀더로 닫는다.
+    _flush_pending_as_error("tool did not run (agent interrupted)")
+
+    return SYSTEM_PROMPT, messages
+
+
+def _loads_safe(s: str) -> dict:
+    """tool_params JSON 문자열을 안전하게 dict 로. 실패 시 빈 dict."""
+    if not s:
+        return {}
+    try:
+        v = json.loads(s)
+        return v if isinstance(v, dict) else {}
+    except (json.JSONDecodeError, TypeError):
+        return {}

@@ -48,10 +48,13 @@ class SnapshotRefreshed(BaseEvent):
 class LLMResponded(BaseEvent):
     """LLM이 다음 툴을 결정함 (Factor 4: 이것은 '제안'이지 '명령'이 아님)"""
     kind:        Literal["LLMResponded"] = "LLMResponded"
-    raw_output:  str = ""             # LLM 원본 출력 (JSON)
+    raw_output:  str = ""             # LLM 원본 출력 (JSON 또는 content block 요약)
     tool_name:   str = ""
     tool_params: str = ""             # JSON string
     reason:      str = ""
+    # Phase 5: Anthropic native tool_use 왕복 ID. 있으면 reducer가
+    # 다음 ToolSucceeded/Failed/Rejected를 tool_result 블록으로 매칭.
+    tool_use_id: str = ""
     # 토큰/비용 관측 (Harness Engineering: 실제 사용량 측정)
     input_tokens:         int = 0
     output_tokens:        int = 0

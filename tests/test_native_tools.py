@@ -68,3 +68,113 @@ def test_tool_schemas_cover_all_executor_handlers():
         "ask_human", "done",
     }
     assert expected.issubset(names), f"누락: {expected - names}"
+
+
+# ── Phase 5: derive_native_context 구조 검증 ──────────────────────
+
+def test_derive_native_context_pairs_tool_use_and_tool_result():
+    """LLMResponded → assistant tool_use, ToolSucceeded → user tool_result 로 매칭."""
+    from events import TaskStarted, LLMResponded, ToolSucceeded
+    from reducer import derive_native_context
+
+    events = [
+        TaskStarted(task="alert_check", portfolio_summary="snapshot"),
+        LLMResponded(
+            raw_output='{}', tool_name="fetch_all_portfolios",
+            tool_params='{}', reason="조회", tool_use_id="tu_abc",
+        ),
+        ToolSucceeded(tool_name="fetch_all_portfolios", result="총 $10,000"),
+    ]
+    system, messages = derive_native_context(events)
+
+    assert system  # SYSTEM_PROMPT 가 system= 로 전달됨
+    # [0] TaskStarted user text, [1] assistant tool_use, [2] user tool_result
+    assert messages[0]["role"] == "user"
+    assert messages[0]["content"][0]["type"] == "text"
+
+    assert messages[1]["role"] == "assistant"
+    tool_use_block = next(b for b in messages[1]["content"]
+                          if b["type"] == "tool_use")
+    assert tool_use_block["id"] == "tu_abc"
+    assert tool_use_block["name"] == "fetch_all_portfolios"
+
+    assert messages[2]["role"] == "user"
+    assert messages[2]["content"][0]["type"] == "tool_result"
+    assert messages[2]["content"][0]["tool_use_id"] == "tu_abc"
+    assert messages[2]["content"][0]["content"] == "총 $10,000"
+
+
+def test_derive_native_context_tool_failed_sets_is_error():
+    """ToolFailed → tool_result.is_error=True."""
+    from events import TaskStarted, LLMResponded, ToolFailed
+    from reducer import derive_native_context
+
+    events = [
+        TaskStarted(task="t", portfolio_summary="s"),
+        LLMResponded(raw_output='{}', tool_name="broken",
+                     tool_params='{}', tool_use_id="tu_err"),
+        ToolFailed(tool_name="broken", error_type="RuntimeError",
+                   error_msg="boom"),
+    ]
+    _, messages = derive_native_context(events)
+    result = messages[-1]["content"][0]
+    assert result["type"] == "tool_result"
+    assert result["tool_use_id"] == "tu_err"
+    assert result["is_error"] is True
+    assert "boom" in result["content"]
+
+
+def test_derive_native_context_closes_orphan_tool_use():
+    """
+    마지막 LLMResponded 뒤에 결과 이벤트가 없으면 placeholder tool_result 로 닫는다.
+    Anthropic API 는 tool_use 없이 assistant 턴이 끝나는 것을 거부한다.
+    """
+    from events import TaskStarted, LLMResponded
+    from reducer import derive_native_context
+
+    events = [
+        TaskStarted(task="t", portfolio_summary="s"),
+        LLMResponded(raw_output='{}', tool_name="x",
+                     tool_params='{}', tool_use_id="tu_x"),
+    ]
+    _, messages = derive_native_context(events)
+    # 마지막이 tool_result 여야 함 (assistant 로 끝나면 API 에러)
+    last = messages[-1]
+    assert last["role"] == "user"
+    assert last["content"][0]["type"] == "tool_result"
+    assert last["content"][0]["is_error"] is True
+
+
+def test_derive_native_context_ask_human_gets_tool_result():
+    """HumanResponded 는 pending 이 ask_human 일 때만 tool_result 로 닫힌다."""
+    from events import TaskStarted, LLMResponded, HumanAsked, HumanResponded
+    from reducer import derive_native_context
+
+    events = [
+        TaskStarted(task="t", portfolio_summary="s"),
+        LLMResponded(raw_output='{}', tool_name="ask_human",
+                     tool_params='{"question":"ok?"}', tool_use_id="tu_ask"),
+        HumanAsked(question="ok?"),
+        HumanResponded(answer="네"),
+    ]
+    _, messages = derive_native_context(events)
+    last = messages[-1]
+    assert last["content"][0]["type"] == "tool_result"
+    assert last["content"][0]["tool_use_id"] == "tu_ask"
+    assert last["content"][0]["content"] == "네"
+
+
+def test_derive_native_context_skips_legacy_events_without_tool_use_id():
+    """tool_use_id 가 비어 있는 레거시 LLMResponded 는 native 경로에서 스킵된다."""
+    from events import TaskStarted, LLMResponded
+    from reducer import derive_native_context
+
+    events = [
+        TaskStarted(task="t", portfolio_summary="s"),
+        LLMResponded(raw_output='{}', tool_name="x", tool_params='{}',
+                     tool_use_id=""),  # 레거시
+    ]
+    _, messages = derive_native_context(events)
+    # TaskStarted 만 남고 assistant/tool_result 블록 없음
+    assert len(messages) == 1
+    assert messages[0]["role"] == "user"

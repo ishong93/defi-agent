@@ -148,18 +148,29 @@ class TestReducerPerformance:
 
 
 # ══════════════════════════════════════════════════════════════════
-#  Prompt Caching (make_anthropic_llm)
+#  Prompt Caching (make_anthropic_llm) — Phase 5 개정
+#
+#  Phase 1 의 "첫 user 메시지 캐싱" 은 Role Hacking 우회용 차선책이었다.
+#  Phase 5 에선 네이티브 `system=` + `tools=` 파라미터로 전환했으므로
+#  캐시 대상도 system 블록 + 마지막 tool 스키마로 이동한다.
 # ══════════════════════════════════════════════════════════════════
 
 class TestPromptCaching:
 
-    def test_cache_control_applied_to_first_message(self):
-        """enable_prompt_cache=True: 첫 메시지에 cache_control 블록이 붙는다"""
+    def _run_with_capture(self, enable_prompt_cache: bool, **llm_kwargs):
         from loop import make_anthropic_llm
 
         captured = {}
         mock_response = MagicMock()
-        mock_response.content = [MagicMock(text="ok")]
+        # tool_use 블록이 없는 단순 텍스트 응답으로 모킹
+        text_block = MagicMock()
+        text_block.type = "text"
+        text_block.text = "ok"
+        mock_response.content = [text_block]
+        mock_response.usage = MagicMock(
+            input_tokens=1, output_tokens=1,
+            cache_read_input_tokens=0, cache_creation_input_tokens=0,
+        )
 
         with patch("loop.anthropic.Anthropic") as mock_client_cls:
             mock_client = mock_client_cls.return_value
@@ -168,47 +179,39 @@ class TestPromptCaching:
                 return mock_response
             mock_client.messages.create.side_effect = _create
 
-            llm = make_anthropic_llm("claude-sonnet-4-20250514",
-                                     enable_prompt_cache=True)
-            messages = [
-                {"role": "user", "content": "SYSTEM PROMPT"},
-                {"role": "assistant", "content": "ack"},
-                {"role": "user", "content": "step 1"},
-            ]
-            llm(messages)
+            llm = make_anthropic_llm(
+                "claude-sonnet-4-20250514",
+                enable_prompt_cache=enable_prompt_cache,
+                **llm_kwargs,
+            )
+            messages = [{"role": "user", "content": "step"}]
+            llm(messages, system="SYSTEM PROMPT")
 
-        sent = captured["messages"]
-        # 첫 메시지의 content는 list 형태 + cache_control
-        assert isinstance(sent[0]["content"], list)
-        assert sent[0]["content"][0]["cache_control"] == {"type": "ephemeral"}
-        assert sent[0]["content"][0]["text"] == "SYSTEM PROMPT"
-        # 나머지는 그대로 string
-        assert sent[1]["content"] == "ack"
-        assert sent[2]["content"] == "step 1"
+        return captured
 
-    def test_cache_disabled_leaves_messages_unchanged(self):
-        """enable_prompt_cache=False: 메시지 구조 변경 없음"""
-        from loop import make_anthropic_llm
+    def test_cache_control_applied_to_system_block(self):
+        """Phase 5: system 프롬프트가 cache_control 블록으로 전달된다."""
+        captured = self._run_with_capture(enable_prompt_cache=True)
 
-        captured = {}
-        mock_response = MagicMock()
-        mock_response.content = [MagicMock(text="ok")]
+        system = captured["system"]
+        assert isinstance(system, list)
+        assert system[0]["cache_control"] == {"type": "ephemeral"}
+        assert system[0]["text"] == "SYSTEM PROMPT"
 
-        with patch("loop.anthropic.Anthropic") as mock_client_cls:
-            mock_client = mock_client_cls.return_value
-            def _create(**kwargs):
-                captured.update(kwargs)
-                return mock_response
-            mock_client.messages.create.side_effect = _create
+    def test_cache_control_applied_to_last_tool_schema(self):
+        """Phase 5: tools 배열 마지막 스키마에 cache_control 이 적용된다."""
+        captured = self._run_with_capture(
+            enable_prompt_cache=True, use_native_tools=True,
+        )
+        tools = captured["tools"]
+        assert "cache_control" in tools[-1]
+        assert tools[-1]["cache_control"] == {"type": "ephemeral"}
+        # 나머지 스키마에는 cache_control 없음
+        assert all("cache_control" not in t for t in tools[:-1])
 
-            llm = make_anthropic_llm("claude-sonnet-4-20250514",
-                                     enable_prompt_cache=False)
-            messages = [
-                {"role": "user", "content": "SYSTEM"},
-                {"role": "user", "content": "step"},
-            ]
-            llm(messages)
-
-        sent = captured["messages"]
-        assert sent[0]["content"] == "SYSTEM"
-        assert sent[1]["content"] == "step"
+    def test_cache_disabled_leaves_system_as_plain_string(self):
+        """enable_prompt_cache=False: system 은 문자열 그대로, tools 도 변경 없음."""
+        captured = self._run_with_capture(enable_prompt_cache=False)
+        assert captured["system"] == "SYSTEM PROMPT"
+        tools = captured.get("tools", [])
+        assert all("cache_control" not in t for t in tools)

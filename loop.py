@@ -8,6 +8,7 @@
 # Factor 12: Stateless Reducer — LLM 함수 주입 가능
 
 import json
+import uuid
 from datetime import datetime, timezone
 from typing import Callable, Optional, TypedDict
 import anthropic
@@ -16,7 +17,8 @@ from events import (TaskStarted, SnapshotRefreshed, LLMResponded,
                     ToolRejected, ToolSucceeded, ToolFailed,
                     HumanAsked, HumanResponded,
                     AgentCompleted, AgentFailed)
-from reducer import (derive_context, should_compact, make_compaction_event,
+from reducer import (derive_context, derive_native_context,
+                     should_compact, make_compaction_event,
                      count_consecutive_errors, count_steps)
 from tools import parse_tool_call, validate_tool_call, ToolExecutor
 from event_store import EventStore
@@ -41,32 +43,36 @@ LLMCallFn = Callable[[list[Message]], "str | tuple[str, LLMUsage]"]
 def make_anthropic_llm(model: str, enable_prompt_cache: bool = True,
                        use_native_tools: bool = True) -> LLMCallFn:
     """
-    Claude API 호출 함수 팩토리.
+    Claude API 호출 함수 팩토리 (Phase 5: 진짜 네이티브 tool_use 프로토콜).
 
-    반환 계약: (text, usage_dict) 튜플. usage_dict는 input/output/cache 토큰 수.
-    하위 호환을 위해 loop.py에서 문자열만 반환하는 레거시 LLM도 허용한다.
+    반환 계약: (text, usage_dict, tool_use_id) 튜플.
+      - text: parse_tool_call이 읽을 수 있는 JSON 문자열
+      - usage_dict: input/output/cache 토큰 수
+      - tool_use_id: Anthropic이 발급한 왕복 ID (tool_result 로 매칭하는 키)
+    하위 호환: 문자열만 반환하는 ScriptedLLM 도 허용한다 (_invoke_llm에서 정규화).
+
+    Phase 5 핵심 변경:
+      - system_prompt 는 `system=` 파라미터로 전달 (Role Hacking 제거).
+        기존에는 "사용자 메시지 + '네, JSON만 반환하겠습니다.'" 로 prefill 하던
+        방식이었는데, 이는 Anthropic 공식 권장이 아니며 모델이 시스템 지시를
+        사용자 발화로 혼동할 여지가 있다.
+      - cache_control 을 system 블록과 마지막 tool 스키마에 적용.
+        Phase 1 의 "첫 user 메시지 캐싱"은 Role Hacking 우회용이었다 (본질적
+        차선책). Phase 5 에선 네이티브 경로에 맞춰 더 큰 프리픽스(system +
+        tools)를 캐시한다.
 
     use_native_tools=True (기본):
-      Anthropic tools 파라미터로 TOOL_SCHEMAS를 전달. 모델은 tool_use 블록으로
-      응답하고, 이를 기존 {"tool","params","reason"} JSON 텍스트로 직렬화해
-      parse_tool_call 파이프라인과 호환을 유지한다. 프롬프트 지시만으로 JSON을
-      강제하던 것과 달리 API 레벨에서 스키마 위반이 원천 차단된다.
-
-    enable_prompt_cache=True (기본):
-      첫 메시지(시스템 프롬프트 + 초기 포트폴리오 스냅샷 포함)에
-      cache_control={"type": "ephemeral"}을 적용.
-      동일 run 내 반복 호출 시 해당 프리픽스의 입력 토큰 비용을
-      최대 90% 절감 (5분 TTL). 캐시 미스 시 정상 동작.
+      TOOL_SCHEMAS 를 tools 파라미터로 전달. 모델은 tool_use 블록으로 응답.
     """
     client = anthropic.Anthropic()
 
-    def call(messages):
-        if enable_prompt_cache and messages:
-            messages = _mark_prefix_for_cache(messages)
+    def call(messages, system: Optional[str] = None):
         kwargs = {"model": model, "max_tokens": 1024, "messages": messages}
+        if system:
+            kwargs["system"] = _system_blocks(system) if enable_prompt_cache else system
         if use_native_tools:
             from tool_schemas import TOOL_SCHEMAS
-            kwargs["tools"] = TOOL_SCHEMAS
+            kwargs["tools"] = _tools_with_cache(TOOL_SCHEMAS) if enable_prompt_cache else TOOL_SCHEMAS
         response = client.messages.create(**kwargs)
         u = response.usage
         usage = {
@@ -76,8 +82,33 @@ def make_anthropic_llm(model: str, enable_prompt_cache: bool = True,
             "cache_creation_tokens": getattr(u, "cache_creation_input_tokens", 0) or 0,
         }
         text = _extract_text_from_response(response, use_native_tools)
-        return text, usage
+        tool_use_id = _extract_tool_use_id(response) if use_native_tools else ""
+        return text, usage, tool_use_id
     return call
+
+
+def _system_blocks(system_prompt: str) -> list[dict]:
+    """system 프롬프트를 캐시 블록 형태로 감싸기."""
+    return [{
+        "type": "text",
+        "text": system_prompt,
+        "cache_control": {"type": "ephemeral"},
+    }]
+
+
+def _tools_with_cache(tool_schemas: list[dict]) -> list[dict]:
+    """
+    tools 배열의 마지막 스키마에 cache_control 적용.
+    Anthropic의 tools caching 은 "마지막으로 표시된 블록까지" 한꺼번에 캐시한다.
+    도구 스키마는 run 동안 변하지 않으므로 히트율이 매우 높다.
+    """
+    if not tool_schemas:
+        return tool_schemas
+    cached = list(tool_schemas)
+    last = dict(cached[-1])
+    last["cache_control"] = {"type": "ephemeral"}
+    cached[-1] = last
+    return cached
 
 
 def _extract_text_from_response(response, use_native_tools: bool) -> str:
@@ -109,38 +140,33 @@ def _extract_text_from_response(response, use_native_tools: bool) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
-def _invoke_llm(llm_fn: LLMCallFn, messages: list) -> tuple[str, dict]:
+def _extract_tool_use_id(response) -> str:
+    """tool_use 블록의 id 를 추출 (왕복 매칭용). 없으면 빈 문자열."""
+    for block in response.content:
+        if getattr(block, "type", None) == "tool_use":
+            return getattr(block, "id", "") or ""
+    return ""
+
+
+def _invoke_llm(llm_fn: LLMCallFn, messages: list,
+                system: Optional[str] = None) -> tuple[str, dict, str]:
     """
-    llm_fn 결과를 (text, usage) 튜플로 정규화.
+    llm_fn 결과를 (text, usage, tool_use_id) 튜플로 정규화.
     ScriptedLLM 등 문자열만 반환하는 함수와 호환을 유지한다.
+
+    Phase 5: 네이티브 경로에서 system= 를 전달한다. llm_fn 이 system 키워드를
+    받지 않으면 (= 레거시 ScriptedLLM) 자동으로 위치 인자만 사용.
     """
-    out = llm_fn(messages)
+    try:
+        out = llm_fn(messages, system=system) if system is not None else llm_fn(messages)
+    except TypeError:
+        # 레거시 ScriptedLLM: system 키워드 미지원
+        out = llm_fn(messages)
     if isinstance(out, tuple):
-        return out[0], out[1] or {}
-    return out, {}
-
-
-def _mark_prefix_for_cache(messages: list) -> list:
-    """
-    첫 user 메시지를 캐시 블록 형태로 변환. 나머지 메시지는 그대로.
-    reducer.derive_context()는 첫 메시지에 SYSTEM_PROMPT를 넣으므로,
-    이 프리픽스는 run 동안 변하지 않아 캐시 히트율이 높다.
-    """
-    if not messages:
-        return messages
-    first = messages[0]
-    content = first.get("content")
-    if isinstance(content, str):
-        cached_first = {
-            "role": first["role"],
-            "content": [{
-                "type": "text",
-                "text": content,
-                "cache_control": {"type": "ephemeral"},
-            }],
-        }
-        return [cached_first] + messages[1:]
-    return messages
+        if len(out) >= 3:
+            return out[0], out[1] or {}, out[2] or ""
+        return out[0], out[1] or {}, ""
+    return out, {}, ""
 
 
 def run_agent(
@@ -208,8 +234,16 @@ def run_agent(
                 events.append(compaction)
 
             # ── Step 1: LLM 호출 (Selection) ─────────────────────
-            messages   = derive_context(events, config.context.context_format)
-            raw_output, usage = _invoke_llm(llm_fn, messages)
+            # Phase 5: 네이티브 경로 — system 프롬프트를 별도 파라미터로,
+            # messages 는 content-block 배열로 구성. Role Hacking 제거.
+            if config.context.context_format == "native":
+                system_prompt, messages = derive_native_context(events)
+            else:
+                system_prompt = None
+                messages = derive_context(events, config.context.context_format)
+            raw_output, usage, tool_use_id = _invoke_llm(
+                llm_fn, messages, system=system_prompt,
+            )
 
             # Factor 7: LLM은 반드시 JSON만 출력 — 파싱 실패 시 에러로 처리
             try:
@@ -233,11 +267,15 @@ def run_agent(
 
             tool_name  = tool_call.get("tool", "unknown")
 
-            # Factor 6: LLM 응답을 실행 전에 기록 (Selection/Execution 분리)
+            # Factor 6: LLM 응답을 실행 전에 기록 (Selection/Execution 분리).
+            # Phase 5: tool_use_id 도 함께 저장 — 없으면 루프가 발급해서
+            # 네이티브 reducer 가 tool_result 왕복을 구성할 수 있게 한다.
+            effective_tool_use_id = tool_use_id or f"synthetic_{uuid.uuid4().hex[:12]}"
             llm_event = LLMResponded(
                 raw_output=raw_output, tool_name=tool_name,
                 tool_params=json.dumps(tool_call.get("params", {}), ensure_ascii=False),
                 reason=tool_call.get("reason", ""),
+                tool_use_id=effective_tool_use_id,
                 input_tokens=usage.get("input_tokens", 0),
                 output_tokens=usage.get("output_tokens", 0),
                 cache_read_tokens=usage.get("cache_read_tokens", 0),
