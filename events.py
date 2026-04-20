@@ -52,6 +52,11 @@ class LLMResponded(BaseEvent):
     tool_name:   str = ""
     tool_params: str = ""             # JSON string
     reason:      str = ""
+    # 토큰/비용 관측 (Harness Engineering: 실제 사용량 측정)
+    input_tokens:         int = 0
+    output_tokens:        int = 0
+    cache_read_tokens:    int = 0    # prompt caching 히트
+    cache_creation_tokens: int = 0   # prompt caching 최초 쓰기
 
 
 @dataclass(frozen=True)

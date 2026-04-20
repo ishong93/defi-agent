@@ -33,12 +33,24 @@ class Message(TypedDict):
     content: object  # str | list[dict] (cache_control 적용 시)
 
 
-LLMCallFn = Callable[[list[Message]], str]
+# LLM 호출 반환: (응답 텍스트, 사용량 정보). 사용량은 없을 수 있음(ScriptedLLM 등).
+LLMUsage = dict  # {input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens}
+LLMCallFn = Callable[[list[Message]], "str | tuple[str, LLMUsage]"]
 
 
-def make_anthropic_llm(model: str, enable_prompt_cache: bool = True) -> LLMCallFn:
+def make_anthropic_llm(model: str, enable_prompt_cache: bool = True,
+                       use_native_tools: bool = True) -> LLMCallFn:
     """
     Claude API 호출 함수 팩토리.
+
+    반환 계약: (text, usage_dict) 튜플. usage_dict는 input/output/cache 토큰 수.
+    하위 호환을 위해 loop.py에서 문자열만 반환하는 레거시 LLM도 허용한다.
+
+    use_native_tools=True (기본):
+      Anthropic tools 파라미터로 TOOL_SCHEMAS를 전달. 모델은 tool_use 블록으로
+      응답하고, 이를 기존 {"tool","params","reason"} JSON 텍스트로 직렬화해
+      parse_tool_call 파이프라인과 호환을 유지한다. 프롬프트 지시만으로 JSON을
+      강제하던 것과 달리 API 레벨에서 스키마 위반이 원천 차단된다.
 
     enable_prompt_cache=True (기본):
       첫 메시지(시스템 프롬프트 + 초기 포트폴리오 스냅샷 포함)에
@@ -51,11 +63,61 @@ def make_anthropic_llm(model: str, enable_prompt_cache: bool = True) -> LLMCallF
     def call(messages):
         if enable_prompt_cache and messages:
             messages = _mark_prefix_for_cache(messages)
-        response = client.messages.create(
-            model=model, max_tokens=1024, messages=messages
-        )
-        return response.content[0].text
+        kwargs = {"model": model, "max_tokens": 1024, "messages": messages}
+        if use_native_tools:
+            from tool_schemas import TOOL_SCHEMAS
+            kwargs["tools"] = TOOL_SCHEMAS
+        response = client.messages.create(**kwargs)
+        u = response.usage
+        usage = {
+            "input_tokens": getattr(u, "input_tokens", 0) or 0,
+            "output_tokens": getattr(u, "output_tokens", 0) or 0,
+            "cache_read_tokens": getattr(u, "cache_read_input_tokens", 0) or 0,
+            "cache_creation_tokens": getattr(u, "cache_creation_input_tokens", 0) or 0,
+        }
+        text = _extract_text_from_response(response, use_native_tools)
+        return text, usage
     return call
+
+
+def _extract_text_from_response(response, use_native_tools: bool) -> str:
+    """
+    Anthropic 응답을 parse_tool_call이 읽을 수 있는 JSON 텍스트로 정규화.
+
+    - tool_use 블록이 있으면 {"tool", "params", "reason"} 형태로 직렬화.
+      reason은 함께 반환된 text 블록이 있으면 채운다 (Claude의 사고 과정).
+    - tool_use가 없으면 text 블록 그대로 반환 (JSON-in-text 레거시 경로).
+    """
+    if not use_native_tools:
+        return response.content[0].text
+
+    text_reason = ""
+    tool_use = None
+    for block in response.content:
+        btype = getattr(block, "type", None)
+        if btype == "text":
+            text_reason = (text_reason + " " + block.text).strip()
+        elif btype == "tool_use":
+            tool_use = block
+    if tool_use is None:
+        return response.content[0].text if response.content else ""
+    payload = {
+        "tool": tool_use.name,
+        "params": dict(tool_use.input or {}),
+        "reason": text_reason,
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _invoke_llm(llm_fn: LLMCallFn, messages: list) -> tuple[str, dict]:
+    """
+    llm_fn 결과를 (text, usage) 튜플로 정규화.
+    ScriptedLLM 등 문자열만 반환하는 함수와 호환을 유지한다.
+    """
+    out = llm_fn(messages)
+    if isinstance(out, tuple):
+        return out[0], out[1] or {}
+    return out, {}
 
 
 def _mark_prefix_for_cache(messages: list) -> list:
@@ -147,7 +209,7 @@ def run_agent(
 
             # ── Step 1: LLM 호출 (Selection) ─────────────────────
             messages   = derive_context(events, config.context.context_format)
-            raw_output = llm_fn(messages)
+            raw_output, usage = _invoke_llm(llm_fn, messages)
 
             # Factor 7: LLM은 반드시 JSON만 출력 — 파싱 실패 시 에러로 처리
             try:
@@ -175,12 +237,21 @@ def run_agent(
             llm_event = LLMResponded(
                 raw_output=raw_output, tool_name=tool_name,
                 tool_params=json.dumps(tool_call.get("params", {}), ensure_ascii=False),
-                reason=tool_call.get("reason", "")
+                reason=tool_call.get("reason", ""),
+                input_tokens=usage.get("input_tokens", 0),
+                output_tokens=usage.get("output_tokens", 0),
+                cache_read_tokens=usage.get("cache_read_tokens", 0),
+                cache_creation_tokens=usage.get("cache_creation_tokens", 0),
             )
             store.append(run_id, llm_event)
             events.append(llm_event)
-            log.info(f"[{step+1}] {tool_name} — {tool_call.get('reason', '')}",
-                     extra={"step": step+1, "tool": tool_name})
+            cache_hit_pct = _cache_hit_pct(usage)
+            log.info(
+                f"[{step+1}] {tool_name} — {tool_call.get('reason', '')} "
+                f"| in={usage.get('input_tokens', 0)} out={usage.get('output_tokens', 0)} "
+                f"cache_hit={cache_hit_pct:.0f}%",
+                extra={"step": step+1, "tool": tool_name, **usage},
+            )
 
             # ── Factor 10: 스텝 수 경고 ──────────────────────────
             current_steps = count_steps(events)
@@ -193,9 +264,16 @@ def run_agent(
                 done_event = AgentCompleted(summary=summary)
                 store.append(run_id, done_event)
                 events.append(done_event)
-                log.info(f"완료: {run_id}")
+                usage_totals = _summarize_usage(events)
+                log.info(
+                    f"완료: {run_id} | calls={usage_totals['llm_calls']} "
+                    f"in={usage_totals['input']} out={usage_totals['output']} "
+                    f"cache_hit={usage_totals['cache_hit_pct']:.0f}%",
+                    extra={"run_id": run_id, **usage_totals},
+                )
                 return {"status": "done", "run_id": run_id, "summary": summary,
-                        "steps": step + 1, "total_events": len(events)}
+                        "steps": step + 1, "total_events": len(events),
+                        "usage": usage_totals}
 
             # ── Factor 8 패턴 2: ask_human → 비동기 중단 ─────────
             if tool_name == "ask_human":
@@ -252,6 +330,31 @@ def run_agent(
 
 
 _HUMAN_APPROVAL_WORDS = {"네", "yes", "승인", "확인", "y"}
+
+
+def _cache_hit_pct(usage: dict) -> float:
+    """프리픽스 캐시 히트율 = cache_read / (cache_read + cache_creation)."""
+    read = usage.get("cache_read_tokens", 0)
+    create = usage.get("cache_creation_tokens", 0)
+    total = read + create
+    return (read / total * 100) if total else 0.0
+
+
+def _summarize_usage(events: list) -> dict:
+    """run 전체의 토큰 사용량 집계 (LLMResponded 이벤트 합산)."""
+    totals = {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0, "llm_calls": 0}
+    for e in events:
+        if isinstance(e, LLMResponded):
+            totals["input"] += e.input_tokens
+            totals["output"] += e.output_tokens
+            totals["cache_read"] += e.cache_read_tokens
+            totals["cache_creation"] += e.cache_creation_tokens
+            totals["llm_calls"] += 1
+    cache_total = totals["cache_read"] + totals["cache_creation"]
+    totals["cache_hit_pct"] = (
+        totals["cache_read"] / cache_total * 100 if cache_total else 0.0
+    )
+    return totals
 
 
 def _handle_rejection(validation, tool_call: dict, tool_name: str,

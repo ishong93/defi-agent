@@ -9,10 +9,14 @@
 #    실제 실행 전에 검증 단계를 삽입할 수 있다."
 
 import json
+import requests
 from dataclasses import dataclass
 from typing import Callable, Optional
 from models import PortfolioSnapshot
 from config import AgentConfig
+from logger import setup_logger
+
+log = setup_logger("tools")
 
 
 # ── 검증 결과 타입 ───────────────────────────────────────────────
@@ -199,14 +203,54 @@ class ToolExecutor:
 
     def _send_to_notion(self, params: dict) -> str:
         report_id = params.get("report_id", "")
-        if not self.config.notion_api_key:
+        if not self.config.notion_api_key or not self.config.notion_db_id:
             return "Notion API 키 미설정 — 로컬 저장으로 대체"
-        return f"Notion 저장 완료: {report_id}"
+        report = self._report_cache.get(report_id)
+        if not report:
+            return f"Notion 저장 실패: 리포트 {report_id} 찾을 수 없음"
+        try:
+            r = requests.post(
+                "https://api.notion.com/v1/pages",
+                headers={
+                    "Authorization": f"Bearer {self.config.notion_api_key}",
+                    "Notion-Version": "2022-06-28",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "parent": {"database_id": self.config.notion_db_id},
+                    "properties": {
+                        "Name": {"title": [{"text": {"content": report_id}}]},
+                        "Type": {"select": {"name": report["type"]}},
+                        "Total USD": {"number": report["snapshot"].total_value_usd},
+                        "Generated": {"date": {"start": report["generated_at"]}},
+                    },
+                },
+                timeout=10,
+            )
+            r.raise_for_status()
+            return f"Notion 저장 완료: {report_id}"
+        except Exception as e:
+            log.warning(f"Notion 호출 실패, 로컬 저장으로 대체: {type(e).__name__}: {e}")
+            return f"Notion 저장 실패(로컬 보관): {type(e).__name__}"
 
     def _send_telegram_alert(self, params: dict) -> str:
         message = params.get("message", "")
         level = params.get("level", "info")
-        if not self.config.telegram_token:
+        if not self.config.telegram_token or not self.config.telegram_chat_id:
             print(f"[TELEGRAM MOCK — {level.upper()}] {message}")
-            return f"텔레그램 전송 완료 (mock)"
-        return f"텔레그램 알림 발송 완료 [{level}]"
+            return "텔레그램 전송 완료 (mock)"
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{self.config.telegram_token}/sendMessage",
+                json={
+                    "chat_id": self.config.telegram_chat_id,
+                    "text": f"[{level.upper()}] {message}",
+                },
+                timeout=10,
+            )
+            r.raise_for_status()
+            return f"텔레그램 알림 발송 완료 [{level}]"
+        except Exception as e:
+            log.warning(f"텔레그램 호출 실패, mock 대체: {type(e).__name__}: {e}")
+            print(f"[TELEGRAM FALLBACK — {level.upper()}] {message}")
+            return f"텔레그램 전송 실패(mock 대체): {type(e).__name__}"
