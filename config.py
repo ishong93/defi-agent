@@ -29,6 +29,31 @@ class ChainConfig:
 
 
 @dataclass
+class WalletConfig:
+    """
+    체인별 조회 대상 지갑 주소.
+
+    우선순위: CLI 인자 > 환경변수 (WALLET_FLARE / WALLET_XDC / WALLET_XRPL) > None.
+    None 이면 해당 체인을 스냅샷 수집 대상에서 제외한다 (placeholder 기본값을
+    두지 않는 이유 — placeholder 는 네트워크 호출로 넘어가 silent-fail 을 만듦).
+    """
+    flare: Optional[str] = field(default_factory=lambda: os.getenv("WALLET_FLARE"))
+    xdc:   Optional[str] = field(default_factory=lambda: os.getenv("WALLET_XDC"))
+    xrpl:  Optional[str] = field(default_factory=lambda: os.getenv("WALLET_XRPL"))
+
+    def as_dict(self) -> dict:
+        """비어있지 않은 주소만 {체인키: 주소} 로 반환."""
+        out: dict = {}
+        if self.flare:
+            out["FLR"] = self.flare
+        if self.xdc:
+            out["XDC"] = self.xdc
+        if self.xrpl:
+            out["XRP"] = self.xrpl
+        return out
+
+
+@dataclass
 class ToolValidationConfig:
     """Factor 4: 도구 호출 검증 설정 (도구 호출 = 제안)"""
     max_transfer_usd: float = 10000.0       # 단일 전송 최대 금액 ($)
@@ -65,6 +90,7 @@ class AgentConfig:
     report_hour: int = 9               # 매일 오전 9시 일간 리포트
     language: str = "ko"               # 리포트 언어
     chains: ChainConfig = field(default_factory=ChainConfig)
+    wallets: WalletConfig = field(default_factory=WalletConfig)
     alerts: AlertThresholds = field(default_factory=AlertThresholds)
     tool_validation: ToolValidationConfig = field(default_factory=ToolValidationConfig)
     error_handling: ErrorHandlingConfig = field(default_factory=ErrorHandlingConfig)
