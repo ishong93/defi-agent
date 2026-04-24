@@ -9,8 +9,7 @@
 
 import json
 from datetime import datetime, timezone
-from typing import Callable, Optional, TypedDict
-import anthropic
+from typing import Callable, Optional
 
 from events import (TaskStarted, SnapshotRefreshed, LLMResponded,
                     ToolRejected, ToolSucceeded, ToolFailed,
@@ -18,67 +17,15 @@ from events import (TaskStarted, SnapshotRefreshed, LLMResponded,
                     AgentCompleted, AgentFailed)
 from reducer import (derive_context, should_compact, make_compaction_event,
                      count_consecutive_errors, count_steps)
-from tools import parse_tool_call, validate_tool_call, ToolExecutor
+from tools import validate_tool_call, ToolExecutor
 from event_store import EventStore
 from models import PortfolioSnapshot
 from config import AgentConfig
 from logger import setup_logger, new_run_id
+from baml_bridge import call_baml_agent, events_to_history_str, baml_result_to_dict, get_tool_name
+from baml_client.baml_client.types import AskHumanCall, DoneCall
 
 log = setup_logger("loop")
-
-# Factor 12: LLM 호출을 추상화 — 테스트 시 ScriptedLLM으로 교체 가능
-class Message(TypedDict):
-    """Anthropic API 호환 메시지 형식 (content는 str 또는 블록 list)."""
-    role: str        # "user" | "assistant"
-    content: object  # str | list[dict] (cache_control 적용 시)
-
-
-LLMCallFn = Callable[[list[Message]], str]
-
-
-def make_anthropic_llm(model: str, enable_prompt_cache: bool = True) -> LLMCallFn:
-    """
-    Claude API 호출 함수 팩토리.
-
-    enable_prompt_cache=True (기본):
-      첫 메시지(시스템 프롬프트 + 초기 포트폴리오 스냅샷 포함)에
-      cache_control={"type": "ephemeral"}을 적용.
-      동일 run 내 반복 호출 시 해당 프리픽스의 입력 토큰 비용을
-      최대 90% 절감 (5분 TTL). 캐시 미스 시 정상 동작.
-    """
-    client = anthropic.Anthropic()
-
-    def call(messages):
-        if enable_prompt_cache and messages:
-            messages = _mark_prefix_for_cache(messages)
-        response = client.messages.create(
-            model=model, max_tokens=1024, messages=messages
-        )
-        return response.content[0].text
-    return call
-
-
-def _mark_prefix_for_cache(messages: list) -> list:
-    """
-    첫 user 메시지를 캐시 블록 형태로 변환. 나머지 메시지는 그대로.
-    reducer.derive_context()는 첫 메시지에 SYSTEM_PROMPT를 넣으므로,
-    이 프리픽스는 run 동안 변하지 않아 캐시 히트율이 높다.
-    """
-    if not messages:
-        return messages
-    first = messages[0]
-    content = first.get("content")
-    if isinstance(content, str):
-        cached_first = {
-            "role": first["role"],
-            "content": [{
-                "type": "text",
-                "text": content,
-                "cache_control": {"type": "ephemeral"},
-            }],
-        }
-        return [cached_first] + messages[1:]
-    return messages
 
 
 def run_agent(
@@ -86,26 +33,23 @@ def run_agent(
     task: str,
     config: AgentConfig,
     human_input_fn: Optional[Callable] = None,
-    llm_fn: Optional[LLMCallFn] = None,
     resume_run_id: Optional[str] = None,
     store: Optional[EventStore] = None,
 ) -> dict:
     """
-    메인 에이전트 루프.
+    BAML 기반 메인 에이전트 루프 (단일 에이전트 모드).
 
-    Factor 6:  Selection(LLM) → Validation → Execution 분리
+    Factor 6:  Selection(BAML) → Validation → Execution 분리
     Factor 8:  세 가지 제어 흐름 패턴 구현
       - done → return (sync 완료)
       - ask_human → 사람 응답 대기 (async break)
       - 도구 실행 → continue (다음 스텝)
     Factor 9:  연속 에러 카운터 + 사람 에스컬레이션
     Factor 10: 스텝 수 경고 (컨텍스트 열화 방지)
-    Factor 12: llm_fn 주입으로 테스트 가능
+    BAML 통합: LLM 호출 + 파싱을 ControllerAgentStep BAML 함수가 담당.
     """
     if human_input_fn is None:
         human_input_fn = _cli_human_input
-    if llm_fn is None:
-        llm_fn = make_anthropic_llm(config.model)
 
     store    = store or EventStore()
     executor = ToolExecutor(snapshot, config)
@@ -138,6 +82,8 @@ def run_agent(
         log.info(f"시작: {run_id} | task={task} | ${snapshot.total_value_usd:,.2f}")
 
     try:
+        portfolio_ctx = snapshot.to_context_summary()
+
         for step in range(config.max_steps):
             # ── Factor 10: 컨텍스트 압축 ─────────────────────────
             if should_compact(events, config.context.max_context_messages):
@@ -145,41 +91,23 @@ def run_agent(
                 store.append(run_id, compaction)
                 events.append(compaction)
 
-            # ── Step 1: LLM 호출 (Selection) ─────────────────────
-            messages   = derive_context(events, config.context.context_format)
-            raw_output = llm_fn(messages)
+            # ── Step 1: BAML 호출 (Selection + 파싱) ────────────
+            history = events_to_history_str(events)
+            result  = call_baml_agent("controller", portfolio_ctx, history, task)
 
-            # Factor 7: LLM은 반드시 JSON만 출력 — 파싱 실패 시 에러로 처리
-            try:
-                tool_call = parse_tool_call(raw_output)
-            except ValueError as e:
-                llm_event = LLMResponded(
-                    raw_output=raw_output, tool_name="__parse_error__",
-                    reason=str(e)[:200]
-                )
-                store.append(run_id, llm_event)
-                events.append(llm_event)
-                err = ToolFailed(
-                    tool_name="__parse_error__",
-                    error_type="JSONParseError",
-                    error_msg=f"JSON 형식 오류. JSON만 출력하세요. 원본: {raw_output[:100]}"
-                )
-                store.append(run_id, err)
-                events.append(err)
-                log.warning(f"[{step+1}] JSON 파싱 실패 — LLM에게 재시도 요청")
-                continue
+            tool_name = get_tool_name(result)
+            tool_dict = baml_result_to_dict(result)
 
-            tool_name  = tool_call.get("tool", "unknown")
-
-            # Factor 6: LLM 응답을 실행 전에 기록 (Selection/Execution 분리)
+            # Factor 6: BAML 응답을 실행 전에 이벤트로 기록 (Selection/Execution 분리)
             llm_event = LLMResponded(
-                raw_output=raw_output, tool_name=tool_name,
-                tool_params=json.dumps(tool_call.get("params", {}), ensure_ascii=False),
-                reason=tool_call.get("reason", "")
+                raw_output=result.model_dump_json(),
+                tool_name=tool_name,
+                tool_params=json.dumps(tool_dict.get("params", {}), ensure_ascii=False),
+                reason=tool_dict.get("reason", ""),
             )
             store.append(run_id, llm_event)
             events.append(llm_event)
-            log.info(f"[{step+1}] {tool_name} — {tool_call.get('reason', '')}",
+            log.info(f"[{step+1}] {tool_name} — {tool_dict.get('reason', '')}",
                      extra={"step": step+1, "tool": tool_name})
 
             # ── Factor 10: 스텝 수 경고 ──────────────────────────
@@ -188,45 +116,40 @@ def run_agent(
                 log.warning(f"스텝 경고: {current_steps}/{config.max_steps}")
 
             # ── Factor 8 패턴 1: done → 동기 완료 ────────────────
-            if tool_name == "done":
-                summary    = tool_call["params"].get("summary", "")
-                done_event = AgentCompleted(summary=summary)
+            if isinstance(result, DoneCall):
+                done_event = AgentCompleted(summary=result.summary)
                 store.append(run_id, done_event)
                 events.append(done_event)
                 log.info(f"완료: {run_id}")
-                return {"status": "done", "run_id": run_id, "summary": summary,
+                return {"status": "done", "run_id": run_id, "summary": result.summary,
                         "steps": step + 1, "total_events": len(events)}
 
             # ── Factor 8 패턴 2: ask_human → 비동기 중단 ─────────
-            if tool_name == "ask_human":
-                p        = tool_call.get("params", {})
-                level    = p.get("level", "info")
-                question = p.get("question", "")
-                ctx_info = p.get("context", "")
-                asked    = HumanAsked(level=level, question=question, context=ctx_info)
+            if isinstance(result, AskHumanCall):
+                asked = HumanAsked(level=result.level, question=result.question,
+                                   context=result.context or "")
                 store.append(run_id, asked)
                 events.append(asked)
-                answer = human_input_fn(level, question, ctx_info)
+                answer = human_input_fn(result.level, result.question, result.context or "")
                 resp   = HumanResponded(answer=answer)
                 store.append(run_id, resp)
                 events.append(resp)
                 continue
 
             # ── Step 2: 검증 (Factor 4: 도구 호출 = 제안) ────────
-            validation = validate_tool_call(tool_call, config)
+            validation = validate_tool_call(tool_dict, config)
             if not validation.approved:
                 approved_by_human = _handle_rejection(
-                    validation, tool_call, tool_name,
+                    validation, tool_dict, tool_name,
                     run_id, store, events, human_input_fn,
                 )
                 if not approved_by_human:
                     continue
-                # 사람이 승인 → 아래 실행 단계로 진행
 
             # ── Step 3: 실행 (Execution) ─────────────────────────
             try:
-                result   = executor.dispatch(tool_call)
-                ok_event = ToolSucceeded(tool_name=tool_name, result=result)
+                exec_result = executor.dispatch(tool_dict)
+                ok_event    = ToolSucceeded(tool_name=tool_name, result=exec_result)
                 store.append(run_id, ok_event)
                 events.append(ok_event)
                 log.debug(f"도구 성공: {tool_name}")

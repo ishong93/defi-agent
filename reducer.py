@@ -27,7 +27,23 @@ from events import (AgentEvent, TaskStarted, SnapshotRefreshed,
                     ToolFailed, HumanAsked, HumanResponded, ContextCompacted,
                     SubAgentStarted, SubAgentCompleted,
                     AgentCompleted, AgentFailed)
-from prompts import SYSTEM_PROMPT, XML_CONTEXT_TEMPLATES
+# 프롬프트는 BAML(baml_src/agents/*.baml)이 관리.
+# 아래 상수는 derive_context() / replay_at() 디버그 재현용으로만 사용.
+SYSTEM_PROMPT = "(BAML 관리 — baml_src/agents/*.baml 참조)"
+
+XML_CONTEXT_TEMPLATES = {
+    "system":         "<system_instruction>\n{content}\n</system_instruction>",
+    "tool_result":    "<tool_result name=\"{name}\">\n{content}\n</tool_result>",
+    "tool_error":     "<tool_error name=\"{name}\">\n{error_type}: {message}\n</tool_error>",
+    "tool_rejected":  "<tool_rejected name=\"{name}\">\n거부 사유: {reason}\n원래 파라미터: {params}\n</tool_rejected>",
+    "human_response": "<human_response>\n{content}\n</human_response>",
+    "portfolio":      "<portfolio_snapshot timestamp=\"{timestamp}\">\n{content}\n</portfolio_snapshot>",
+    "snapshot_refresh":  "<snapshot_refreshed stale_minutes=\"{stale_minutes}\">\n{content}\n</snapshot_refreshed>",
+    "compaction":     "<compacted_summary count=\"{count}\">\n{content}\n</compacted_summary>",
+    "step_warning":   "<step_warning current=\"{current}\" max=\"{max}\">\n{message}\n</step_warning>",
+    "error_escalation": "<error_escalation consecutive=\"{count}\">\n{message}\n</error_escalation>",
+    "sub_agent_result": "<sub_agent_result agent=\"{name}\" status=\"{status}\">\n{content}\n</sub_agent_result>",
+}
 
 
 MAX_CONTEXT_MESSAGES = 20

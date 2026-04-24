@@ -4,9 +4,10 @@
 #   "LLM이 선택한 도구 호출은 '제안(proposal)'이지 '명령'이 아니다."
 #   코드가 최종 결정권을 갖는다 — 검증, 거부, 드라이런 모두 가능.
 #
-# Factor 6 원문 핵심:
-#   "Selection/Execution 분리 — LLM이 도구를 선택한 후,
-#    실제 실행 전에 검증 단계를 삽입할 수 있다."
+# BAML 통합 후:
+#   parse_tool_call() 제거 — BAML이 타입 안전한 파싱을 담당.
+#   validate_tool_call()은 baml_bridge.baml_result_to_dict()로
+#   변환된 dict를 받아 기존과 동일한 비즈니스 검증을 수행한다.
 
 import json
 from dataclasses import dataclass
@@ -24,25 +25,6 @@ class ValidationResult:
     reject_reason: Optional[str] = None
     requires_human: bool = False
     human_question: Optional[str] = None
-
-
-# ── 파싱 ─────────────────────────────────────────────────────────
-
-def parse_tool_call(llm_output: str) -> dict:
-    """
-    LLM 출력에서 도구 호출 파싱.
-    Factor 7: LLM은 반드시 JSON만 출력해야 한다.
-    파싱 실패 시 프레임워크가 대신 의사결정하지 않고 에러를 발생시킨다.
-    """
-    try:
-        text = llm_output.strip()
-        if "```" in text:
-            text = text.split("```")[1].lstrip("json").strip()
-        return json.loads(text)
-    except Exception as e:
-        raise ValueError(
-            f"LLM JSON 파싱 실패: {e} | 출력: {llm_output[:150]}"
-        )
 
 
 # ── 검증 (Factor 4: Selection → Validation → Execution) ─────────
